@@ -1,0 +1,149 @@
+{
+  "id": "102019aa91b85b77022945c894ce5b4287c",
+  "version": "102019b065294ad73f3a97c533ff432f357",
+  "schema": {
+    "name": "high_score",
+    "description": "Stores high scores for the 3D endless tunnel survival game.",
+    "fields": [
+      {
+        "name": "id",
+        "description": "Unique identifier for each high score entry.",
+        "type": 1,
+        "compliance": {
+          "confidentiality": 2,
+          "reason": "Internal unique identifier for the record."
+        }
+      },
+      {
+        "name": "data_creator",
+        "description": "id of the user who creates the record",
+        "type": 1,
+        "compliance": {
+          "confidentiality": 2,
+          "reason": "Internal user identifier for tracking purposes."
+        }
+      },
+      {
+        "name": "data_updater",
+        "description": "id of the user who updates the record",
+        "type": 1,
+        "compliance": {
+          "confidentiality": 2,
+          "reason": "Internal user identifier for tracking purposes."
+        }
+      },
+      {
+        "name": "create_time",
+        "description": "create time in timestamp unix",
+        "type": 1,
+        "compliance": {
+          "confidentiality": 1,
+          "reason": "Timestamp of the high score achievement is public."
+        },
+        "format": "timestamp"
+      },
+      {
+        "name": "update_time",
+        "description": "update time in timestamp unix",
+        "type": 1,
+        "compliance": {
+          "confidentiality": 2,
+          "reason": "Internal record update time."
+        },
+        "format": "timestamp"
+      },
+      {
+        "name": "player_name",
+        "description": "The display name of the player who achieved the score.",
+        "type": 1,
+        "compliance": {
+          "confidentiality": 1,
+          "reason": "Player name is public on the leaderboard."
+        }
+      },
+      {
+        "name": "score",
+        "description": "The final score achieved by the player.",
+        "type": 2,
+        "compliance": {
+          "confidentiality": 1,
+          "reason": "Score is a key public component of the leaderboard."
+        },
+        "taxonomy": {
+          "category": "game_analytics",
+          "subject": "player_performance"
+        },
+        "numeric": "int"
+      },
+      {
+        "name": "level_reached",
+        "description": "The highest level reached by the player in that run.",
+        "type": 2,
+        "compliance": {
+          "confidentiality": 1,
+          "reason": "Level reached is public on the leaderboard."
+        },
+        "taxonomy": {
+          "category": "game_analytics",
+          "subject": "player_performance"
+        },
+        "numeric": "int"
+      },
+      {
+        "name": "time_survived",
+        "description": "The total time survived by the player in milliseconds.",
+        "type": 2,
+        "compliance": {
+          "confidentiality": 1,
+          "reason": "Time survived is public on the leaderboard."
+        },
+        "taxonomy": {
+          "category": "game_analytics",
+          "subject": "player_performance"
+        },
+        "numeric": "int"
+      }
+    ],
+    "indexes": [
+      {
+        "fields": [
+          "id"
+        ],
+        "unique": true,
+        "primary": true,
+        "order": false
+      },
+      {
+        "fields": [
+          "data_creator"
+        ],
+        "order": false
+      },
+      {
+        "fields": [
+          "data_updater"
+        ],
+        "order": false
+      },
+      {
+        "fields": [
+          "score"
+        ],
+        "order": true
+      }
+    ]
+  },
+  "task": {
+    "id": "6938ea0a223a4503a8347a29",
+    "root": "69210cbddf57190621e0c946",
+    "project": "69210cbddf57190621e0c945",
+    "user": "110514788935427905742"
+  },
+  "namespace": {
+    "id": "01987547fc6c72ecb453bd2736bd4ea0",
+    "tenant": 2,
+    "name": "global-1",
+    "default": true
+  },
+  "revision": 1
+}

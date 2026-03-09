@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { GripVertical, Music, Plus, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, GripVertical, Music, Plus, Trash2, X } from "lucide-react";
 import {
 	Sheet,
 	SheetContent,
@@ -13,13 +13,14 @@ import { Slider } from "@/components/ui/slider";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { usePlaylistStore } from "@/stores/playlistStore";
+import { useSfxStore, SFX_LABELS, type SfxLevels } from "@/stores/sfxStore";
 
-export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | null }) {
+export function PlaylistSettings({ currentTrackId, onPlayTrack }: { currentTrackId: string | null; onPlayTrack?: (trackId: string) => void }) {
 	const {
 		tracks,
 		volume,
 		shuffle,
-		addTrack,
+		addTrackFromFile,
 		removeTrack,
 		toggleTrack,
 		reorderTracks,
@@ -28,6 +29,8 @@ export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | 
 		resetToDefaults,
 	} = usePlaylistStore();
 
+	const { levels: sfxLevels, setLevel: setSfxLevel, resetToDefaults: resetSfx } = useSfxStore();
+	const [sfxOpen, setSfxOpen] = useState(false);
 	const [dragIndex, setDragIndex] = useState<number | null>(null);
 	const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
 	const [isDroppingFile, setIsDroppingFile] = useState(false);
@@ -72,17 +75,12 @@ export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | 
 	};
 
 	const addAudioFile = (file: File) => {
-		if (file.size > 10 * 1024 * 1024) {
-			alert("File is too large (max 10MB). Consider using a smaller file.");
+		if (file.size > 50 * 1024 * 1024) {
+			alert("File is too large (max 50MB).");
 			return;
 		}
-		const reader = new FileReader();
-		reader.onload = () => {
-			const dataUrl = reader.result as string;
-			const name = file.name.replace(/\.[^/.]+$/, "");
-			addTrack(name, dataUrl);
-		};
-		reader.readAsDataURL(file);
+		const name = file.name.replace(/\.[^/.]+$/, "");
+		addTrackFromFile(name, file);
 	};
 
 	return (
@@ -166,10 +164,13 @@ export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | 
 								<div className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse flex-shrink-0" />
 							)}
 
-							<div className="flex-1 min-w-0">
+							<div
+							className="flex-1 min-w-0 cursor-pointer"
+							onClick={() => track.enabled && onPlayTrack?.(track.id)}
+						>
 								<div
 									className={`font-mono text-[11px] tracking-wide truncate ${
-										track.enabled ? "text-cyan-200" : "text-cyan-600"
+										track.enabled ? "text-cyan-200 hover:text-white" : "text-cyan-600"
 									}`}
 								>
 									{track.name}
@@ -177,6 +178,11 @@ export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | 
 								{track.isBundled && (
 									<div className="font-mono text-[8px] tracking-widest text-cyan-500/50">
 										DEFAULT
+									</div>
+								)}
+								{track.unavailable && (
+									<div className="font-mono text-[8px] tracking-widest text-red-400/70">
+										UNAVAILABLE
 									</div>
 								)}
 							</div>
@@ -198,8 +204,6 @@ export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | 
 						</div>
 					))}
 				</ScrollArea>
-
-				<Separator className="bg-cyan-500/20" />
 
 				<div className="px-4 py-3 space-y-2">
 					<div
@@ -237,6 +241,53 @@ export function PlaylistSettings({ currentTrackId }: { currentTrackId: string | 
 						RESET.DEFAULTS
 					</button>
 				</div>
+
+				<Separator className="bg-cyan-500/20" />
+
+				{/* Collapsible SFX levels */}
+				<div className="px-4 py-2">
+					<button
+						onClick={() => setSfxOpen(!sfxOpen)}
+						className="flex items-center gap-1 w-full font-mono text-[10px] tracking-wider text-cyan-400/70 hover:text-cyan-300 transition-colors"
+					>
+						{sfxOpen ? (
+							<ChevronDown className="w-3 h-3" />
+						) : (
+							<ChevronRight className="w-3 h-3" />
+						)}
+						SOUND.FX
+					</button>
+				</div>
+
+				{sfxOpen && (
+					<div className="px-4 pb-3 space-y-3">
+						{(Object.keys(SFX_LABELS) as (keyof SfxLevels)[]).map((key) => (
+							<div key={key} className="space-y-1">
+								<div className="flex items-center justify-between">
+									<span className="font-mono text-[9px] tracking-wider text-cyan-400/60">
+										{SFX_LABELS[key]}
+									</span>
+									<span className="font-mono text-[9px] text-cyan-300/70">
+										{Math.round(sfxLevels[key] * 100)}%
+									</span>
+								</div>
+								<Slider
+									value={[sfxLevels[key] * 100]}
+									onValueChange={([v]) => setSfxLevel(key, v / 100)}
+									max={100}
+									step={1}
+									className="w-full"
+								/>
+							</div>
+						))}
+						<button
+							onClick={resetSfx}
+							className="w-full py-1 font-mono text-[8px] tracking-widest text-cyan-600 hover:text-cyan-400 transition-colors"
+						>
+							RESET.SFX.DEFAULTS
+						</button>
+					</div>
+				)}
 			</SheetContent>
 		</Sheet>
 	);

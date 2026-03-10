@@ -11,7 +11,7 @@ import flybyAudioFile from "@/assets/Abstract_Fly_By_06.mp3";
 import { PlaylistManager } from "@/lib/PlaylistManager";
 import { usePlaylistStore } from "@/stores/playlistStore";
 import { useSfxStore } from "@/stores/sfxStore";
-import { BehaviorSystem, getMurmurationZBoost } from "@/game/behavior";
+import { BehaviorSystem, getMurmurationZBoost, isMurmurationActive, didMurmurationJustTrigger } from "@/game/behavior";
 import type { BehaviorState, BehaviorContext } from "@/game/behavior";
 import { PlaylistSettings } from "@/components/PlaylistSettings";
 import { PilotSettings } from "@/components/PilotSettings";
@@ -60,6 +60,7 @@ interface GameState {
 	maxAge: number;
 	showAgeInput: boolean;
 	rageLevel: number; // 0-100, current accumulated rage in the environment
+	collisionCount: number; // total non-mote collisions
 	deathSequence: boolean;   // true when dying — tunnel darkens
 	deathStartTime: number;   // when the death sequence began
 }
@@ -73,6 +74,7 @@ interface Obstacle {
 	birthTime: number; // When it was created
 	angerLevel: number; // 0-1, how angry this cloud being is
 	angerTime: number; // When it was last angered
+	lastCollisionTime: number; // Cooldown to prevent multi-count
 	behavior: BehaviorState | null; // Behavior system state
 }
 
@@ -185,13 +187,16 @@ export function TunnelGame() {
 		maxAge: 80 + Math.floor(Math.random() * 41), // Random between 80-120
 		showAgeInput: true,
 		rageLevel: 0,
+			collisionCount: 0,
 		deathSequence: false,
 		deathStartTime: 0,
 	});
 	const [highScores, setHighScores] = useState<HighScoreModel[]>([]);
 	const [showHighScores, setShowHighScores] = useState(false);
+	const [radioOpen, setRadioOpen] = useState(true);
+	const [musicMuted, setMusicMuted] = useState(false);
 	const [ageInput, setAgeInput] = useState("");
-	const [showStoryModal, setShowStoryModal] = useState(true);
+	const [showStoryModal, setShowStoryModal] = useState(() => !usePilotStore.getState().settings.skipIntro);
 	const [storyStarted, setStoryStarted] = useState(false);
 	const [storyText, setStoryText] = useState("");
 	const [showContinueButton, setShowContinueButton] = useState(false);
@@ -223,12 +228,24 @@ export function TunnelGame() {
 	const atmosphericAmbientRef = useRef<HTMLAudioElement | null>(null);
 	const audioAmplitudeRef = useRef<number>(0);
 	const knockbackRef = useRef<{ vx: number; vy: number; spin: number }>({ vx: 0, vy: 0, spin: 0 });
+	const wallBounceRef = useRef(0); // time remaining on wall bounce (seconds) — skip wall checks while > 0
 	const behaviorSystemRef = useRef<BehaviorSystem>(new BehaviorSystem());
 	const [currentTrackId, setCurrentTrackId] = useState<string | null>(null);
 	const playlistTracks = usePlaylistStore((s) => s.tracks);
+	const playlistPlaylists = usePlaylistStore((s) => s.playlists);
+	const playlistActiveIndex = usePlaylistStore((s) => s.activePlaylistIndex);
 	const playlistVolume = usePlaylistStore((s) => s.volume);
-	const playlistShuffle = usePlaylistStore((s) => s.shuffle);
+	const setActivePlaylist = usePlaylistStore((s) => s.setActivePlaylist);
 	const hydrateBlobs = usePlaylistStore((s) => s.hydrateBlobs);
+
+	// Resolve active playlist's track IDs to actual track objects
+	const activePlaylist = playlistPlaylists[playlistActiveIndex] ?? playlistPlaylists[0];
+	const activePlaylistTracks = activePlaylist
+		? activePlaylist.trackIds
+				.map((id) => playlistTracks.find((t) => t.id === id))
+				.filter((t): t is NonNullable<typeof t> => t != null)
+		: [];
+	const activePlaylistShuffle = activePlaylist?.shuffle ?? false;
 
 	// Resolve IDB blobs into object URLs on mount
 	const hydrated = useRef(false);
@@ -246,13 +263,63 @@ export function TunnelGame() {
 	const pilotRef = useRef(pilotSettings);
 	pilotRef.current = pilotSettings;
 	const autopilotVelRef = useRef({ x: 0, y: 0 });
+	const lightCycleRef = useRef(0.5);
+	// Fog bank system: physical fog discs that scroll through the tunnel
+	interface FogBank {
+		discs: THREE.Mesh[];
+		zStart: number; // z of the first disc
+		active: boolean;
+	}
+	const fogBanksRef = useRef<FogBank[]>([]);
+	const fogSpawnTimerRef = useRef(0); // starts with fog at game begin
+	const fogDiscGeometry = useRef<THREE.CircleGeometry | null>(null);
+	const fogDiscMaterial = useRef<THREE.MeshBasicMaterial | null>(null);
+
+	const createFogBank = (zStart: number, numDiscs: number, peakOpacity: number): FogBank => {
+		if (!fogDiscGeometry.current) {
+			fogDiscGeometry.current = new THREE.CircleGeometry(6, 16); // slightly larger than tunnel
+		}
+		if (!fogDiscMaterial.current) {
+			fogDiscMaterial.current = new THREE.MeshBasicMaterial({
+				color: 0x8a8070, // warm gray mist
+				transparent: true,
+				opacity: 0.1,
+				depthWrite: false,
+				side: THREE.DoubleSide,
+			});
+		}
+
+		const discs: THREE.Mesh[] = [];
+		const spacing = 0.4; // very tight spacing for seamless gradient
+		for (let i = 0; i < numDiscs; i++) {
+			const mat = fogDiscMaterial.current.clone();
+			// Bell curve opacity: thick in center, transparent at edges
+			// Wider gaussian (sigma ~0.35) for smoother transitions
+			const t01 = i / (numDiscs - 1); // 0 to 1
+			const bell = Math.exp(-((t01 - 0.5) * (t01 - 0.5)) / 0.08);
+			mat.opacity = bell * peakOpacity;
+			const disc = new THREE.Mesh(fogDiscGeometry.current, mat);
+			disc.position.set(0, 0, zStart - i * spacing);
+			disc.renderOrder = 999; // render after other objects
+			sceneRef.current?.add(disc);
+			discs.push(disc);
+		}
+		return { discs, zStart, active: true };
+	};
+	const boldTargetRef = useRef<{ x: number; y: number; z: number; nextPickTime: number; peelOff: boolean; peelStart: number } | null>(null);
 	const manualOverrideRef = useRef(0); // timestamp of last manual input
 	const cameraShakeRef = useRef(0); // current shake intensity, decays each frame
 	const speedRef = useRef(0); // current game speed in z-units/sec for HUD
 	const bassEnergyRef = useRef(0); // smoothed bass energy 0-1 from audio analyser
-	const spikeRef = useRef(0); // current amplitude spike intensity, decays fast
+	const midEnergyRef = useRef(0); // smoothed mid energy for level meter
+	const trebleEnergyRef = useRef(0); // smoothed treble energy for level meter
+	// Mote relay wave — a red "message" that ripples down the tunnel
+	const moteRelayRef = useRef<{ startTime: number; startZ: number; prevWavefrontZ: number; visited: Set<Mote> } | null>(null);
+	const relayMotesRef = useRef<Map<Mote, number>>(new Map()); // mote → time angered
 
 	const lastCorkscrewSpawnRef = useRef(0);
+	// Reusable vector pool for per-frame behavior context (avoids allocations)
+	const quarkPosPoolRef = useRef<THREE.Vector3[]>([]);
 
 	// Update game state ref when state changes
 	useEffect(() => {
@@ -265,7 +332,7 @@ export function TunnelGame() {
 			playlistManagerRef.current = new PlaylistManager(setCurrentTrackId);
 		}
 		const pm = playlistManagerRef.current;
-		pm.updatePlaylist(playlistTracks, playlistVolume, playlistShuffle);
+		pm.updatePlaylist(activePlaylistTracks, playlistVolume, activePlaylistShuffle);
 		pm.fadeIn(8000);
 
 		// Proximity sound (drones) — starts silent, volume controlled by game
@@ -396,17 +463,42 @@ export function TunnelGame() {
 		loadHighScores();
 	};
 
-	// Initialize and play collision sound effect
+	// Audio pool — reuse a small set of Audio elements instead of creating new ones
+	const audioPoolRef = useRef<HTMLAudioElement[]>([]);
+	const audioPoolIndex = useRef(0);
+	const getPooledAudio = (src: string, volume: number) => {
+		const POOL_SIZE = 8;
+		if (audioPoolRef.current.length < POOL_SIZE) {
+			audioPoolRef.current.push(new Audio());
+		}
+		const audio = audioPoolRef.current[audioPoolIndex.current % POOL_SIZE];
+		audioPoolIndex.current++;
+		audio.src = src;
+		audio.volume = volume;
+		audio.currentTime = 0;
+		audio.play().catch(() => {});
+	};
+
 	const playCollisionSound = () => {
-		const sound = new Audio(bombAudio);
-		sound.volume = sfxLevelsRef.current.collision;
-		sound.play().catch(() => {});
+		getPooledAudio(bombAudio, sfxLevelsRef.current.collision);
 	};
 
 	const playFlareHitSound = () => {
-		const sound = new Audio(bombAudio);
-		sound.volume = sfxLevelsRef.current.flareHit;
-		sound.play().catch(() => {});
+		getPooledAudio(bombAudio, sfxLevelsRef.current.flareHit);
+	};
+
+	// Dispose geometry & materials from a mesh (or group) to free GPU memory
+	const disposeMesh = (obj: THREE.Object3D) => {
+		obj.traverse((child) => {
+			if (child instanceof THREE.Mesh) {
+				child.geometry?.dispose();
+				if (Array.isArray(child.material)) {
+					child.material.forEach((m) => m.dispose());
+				} else if (child.material) {
+					child.material.dispose();
+				}
+			}
+		});
 	};
 
 
@@ -419,9 +511,16 @@ export function TunnelGame() {
 	// Keep playlist in sync when user changes settings mid-game
 	useEffect(() => {
 		if (playlistManagerRef.current) {
-			playlistManagerRef.current.updatePlaylist(playlistTracks, playlistVolume, playlistShuffle);
+			playlistManagerRef.current.updatePlaylist(activePlaylistTracks, playlistVolume, activePlaylistShuffle);
 		}
-	}, [playlistTracks, playlistVolume, playlistShuffle]);
+	}, [activePlaylistTracks, playlistVolume, activePlaylistShuffle]);
+
+	// Sync mute state
+	useEffect(() => {
+		if (playlistManagerRef.current) {
+			playlistManagerRef.current.setMuted(musicMuted);
+		}
+	}, [musicMuted]);
 
 	// Clean up audio on unmount
 	useEffect(() => {
@@ -439,7 +538,7 @@ export function TunnelGame() {
 
 	// Initialize Three.js scene
 	useEffect(() => {
-		if (!canvasRef.current || gameState.isGameOver || gameState.showAgeInput || showStoryModal) return;
+		if (!canvasRef.current || gameState.showAgeInput || showStoryModal) return;
 
 		// Scene setup
 		const scene = new THREE.Scene();
@@ -474,6 +573,11 @@ export function TunnelGame() {
 		const rimLight = new THREE.DirectionalLight(0xffd9a3, 0.1);
 		rimLight.position.set(-5, -3, -10);
 		scene.add(rimLight);
+
+		// Red backlight — rage indicator, positioned behind the camera
+		const rageLight = new THREE.PointLight(0xff2200, 0, 40);
+		rageLight.position.set(0, 0, 8);
+		scene.add(rageLight);
 
 		// Create origami spaceship
 		const spaceship = createOrigamiSpaceship();
@@ -526,9 +630,13 @@ export function TunnelGame() {
 			const deltaTime = (currentTime - lastTime) / 1000;
 			lastTime = currentTime;
 
-			// After game over, keep rendering the dim tunnel but don't update game logic
+			// After game over, render a dim static tunnel behind the modal
 			if (gameStateRef.current.isGameOver && !gameStateRef.current.deathSequence) {
-				// Just render static scene with dim lighting
+				scene.background = new THREE.Color(0x050808);
+				ambientLight.intensity = 0.04;
+				directionalLight.intensity = 0.1;
+				rimLight.intensity = 0.04;
+				rageLight.intensity = 0;
 				renderer.render(scene, camera);
 				animationFrameRef.current = requestAnimationFrame(gameLoop);
 				return;
@@ -540,10 +648,15 @@ export function TunnelGame() {
 			// for an organic, unpredictable feel. Mostly dark, occasional swells.
 			const t = currentTime / 1000;
 			const cycle = 0.5 + 0.5 * Math.sin(t * 0.15) * Math.sin(t * 0.07 + 1.3);
+			// Start in darkness, stay very dark for 20 seconds then ramp to mid-range
+			const timeSinceStart = (currentTime - (gameStateRef.current.timeStarted || currentTime)) / 1000;
+			const startRamp = timeSinceStart < 10 ? 0 : Math.min(0.4, (timeSinceStart - 10) / 20) * 2.5; // black for 10s, then 0→1 over next 20s
+			const adjustedCycle = cycle * startRamp;
+			lightCycleRef.current = adjustedCycle;
 			// cycle is 0–1, where 0 = darkest, 1 = brightest
-			let ambientIntensity = 0.04 + cycle * 0.08;
-			let directionalIntensity = 0.1 + cycle * 0.5;
-			let rimIntensity = 0.05 + cycle * 0.25;
+			let ambientIntensity = 0.04 + adjustedCycle * 0.06;
+			let directionalIntensity = 0.2 + adjustedCycle * 0.2;
+			let rimIntensity = 0.15 + adjustedCycle * 0.15;
 
 			// Death sequence: dim lights, ship flies into the fog
 			const state = gameStateRef.current;
@@ -575,12 +688,13 @@ export function TunnelGame() {
 				// Ship flies forward into the tunnel and shrinks into the distance
 				if (spaceshipRef.current) {
 					const ship = spaceshipRef.current;
-					// Accelerate forward (negative z)
+					// Accelerate forward (negative z) — use deltaTime (computed before lastTime update)
 					const flySpeed = progress * progress * 30; // accelerating
-					ship.position.z -= flySpeed * (currentTime - lastTime) / 1000;
-					// Drift gently to center
-					ship.position.x *= 0.97;
-					ship.position.y *= 0.97;
+					ship.position.z -= flySpeed * deltaTime;
+					// Drift toward tunnel center
+					const centerRate = 1 - Math.pow(0.03, deltaTime); // frame-rate independent
+					ship.position.x *= 1 - centerRate;
+					ship.position.y *= 1 - centerRate;
 					// Shrink as it recedes
 					const shipScale = Math.max(0, 1 - progress * 1.2);
 					ship.scale.setScalar(shipScale);
@@ -598,6 +712,44 @@ export function TunnelGame() {
 			ambientLight.intensity = ambientIntensity;
 			directionalLight.intensity = directionalIntensity;
 			rimLight.intensity = rimIntensity;
+
+			// Red backlight — fades in above 30% rage, max intensity 0.8
+			const ragePercent = (gameStateRef.current.rageLevel ?? 0) / 100;
+			const rageLightStrength = ragePercent > 0.3 ? ((ragePercent - 0.3) / 0.7) * 0.8 : 0;
+			rageLight.intensity = rageLightStrength;
+
+			// Fog banks — physical disc clouds that scroll through the tunnel
+			const fogSpeed = speedRef.current || 3;
+
+			// Spawn opening fog bank and periodic ones
+			fogSpawnTimerRef.current -= deltaTime;
+			if (fogSpawnTimerRef.current <= 0 && fogBanksRef.current.length === 0) {
+				const isOpening = currentTime - (gameStateRef.current.timeStarted || 0) < 5000;
+				const numDiscs = isOpening ? 140 : (150 + Math.floor(Math.random() * 50)); // in-tunnel: 150-200 discs × 0.4 = 60-80 units deep
+				const peak = isOpening ? 0.18 : (0.08 + Math.random() * 0.05); // in-tunnel: 8-13% per disc
+				const zSpawn = isOpening ? -2 : -50 - Math.random() * 30;
+				const bank = createFogBank(zSpawn, numDiscs, peak);
+				fogBanksRef.current.push(bank);
+				fogSpawnTimerRef.current = 90 + Math.random() * 180; // next in 90-270s
+			}
+
+			// Update fog disc positions
+			fogBanksRef.current = fogBanksRef.current.filter((bank) => {
+				let allPassed = true;
+				for (const disc of bank.discs) {
+					disc.position.z += fogSpeed * deltaTime;
+					if (disc.position.z < 10) allPassed = false;
+				}
+				if (allPassed) {
+					// Remove all discs from scene
+					for (const disc of bank.discs) {
+						sceneRef.current?.remove(disc);
+						(disc.material as THREE.Material).dispose();
+					}
+					return false;
+				}
+				return true;
+			});
 
 			// Camera shake — offset camera, render, then restore
 			const shake = cameraShakeRef.current;
@@ -630,7 +782,7 @@ export function TunnelGame() {
 			renderer.dispose();
 
 		};
-	}, [gameState.isGameOver, gameState.showAgeInput, showStoryModal]);
+	}, [gameState.showAgeInput, showStoryModal]);
 
 	const createOrigamiSpaceship = (): THREE.Group => {
 		const group = new THREE.Group();
@@ -708,12 +860,12 @@ export function TunnelGame() {
 		return segment;
 	};
 
-	const getTunnelRadius = (segmentIndex: number): number => {
+	const getTunnelRadius = (_segmentIndex: number): number => {
 		const baseRadius = 5;
-		const level = gameStateRef.current.level;
-		// Gradual narrowing: 5% per level, minimum 60% of original
-		const narrowing = Math.max(0.6, 1 - (level - 1) * 0.05);
-		return baseRadius * narrowing;
+		// Slow organic fluctuation between 90%-110% radius
+		const t = Date.now() / 1000;
+		const wave = 0.5 + 0.5 * Math.sin(t * 0.04) * Math.sin(t * 0.017 + 0.7);
+		return baseRadius * (0.9 + wave * 0.2);
 	};
 
 	const createObstacle = (zPosition: number): Obstacle => {
@@ -757,6 +909,7 @@ export function TunnelGame() {
 				velocity: new THREE.Vector3(0, 0, 0),
 				birthTime: Date.now(),
 				angerLevel: 0,
+				lastCollisionTime: 0,
 				angerTime: 0,
 				behavior: beh,
 			};
@@ -806,6 +959,7 @@ export function TunnelGame() {
 				velocity: new THREE.Vector3(0, 0, 0),
 				birthTime: Date.now(),
 				angerLevel: 0,
+				lastCollisionTime: 0,
 				angerTime: 0,
 				behavior: beh,
 			};
@@ -856,16 +1010,16 @@ export function TunnelGame() {
 		// Random starting angle around the tunnel
 		const angle = Math.random() * Math.PI * 2;
 
-		// Position on the inner surface of the tunnel (slightly inside to ensure visibility)
+		// Position on the inner surface of the tunnel
 		const tunnelRadius = getTunnelRadius(Math.floor(-zPosition / 5));
-		const radius = tunnelRadius * 0.8; // 80% of tunnel radius to sit on surface
+		const radius = tunnelRadius * 0.95; // 95% of tunnel radius to sit on surface
 
 		// Calculate position
 		const x = Math.cos(angle) * radius;
 		const y = Math.sin(angle) * radius;
 
-		// Random size: 1x to 4x base scale
-		const sizeMultiplier = 1 + Math.random() * 3;
+		// Random size: 0.5x to 3x base scale
+		const sizeMultiplier = 0.5 + Math.random() * 2.5;
 
 		// Use orb GLB model if loaded, otherwise fallback to sphere geometry
 		if (orbModelRef.current) {
@@ -950,12 +1104,12 @@ export function TunnelGame() {
 		}
 	};
 
-	const createQuarkPair = (zPosition: number): QuarkPair => {
-		const createShardMesh = (): THREE.Mesh => {
+	const createQuarkPair = (zPosition: number, scale: number = 1.0): QuarkPair => {
+		const createShardMesh = (s: number): THREE.Mesh => {
 			if (shardModelRef.current) {
 				const modelClone = shardModelRef.current.clone();
-				modelClone.scale.set(1.2, 1.2, 1.2);
-				// Add subtle emissive glow to all meshes so they're visible in the tunnel
+				const ms = 1.2 * s;
+				modelClone.scale.set(ms, ms, ms);
 				modelClone.traverse((child) => {
 					if ((child as THREE.Mesh).isMesh) {
 						const m = child as THREE.Mesh;
@@ -974,11 +1128,12 @@ export function TunnelGame() {
 				return group as unknown as THREE.Mesh;
 			}
 			// Fallback: thin glowing cylinder
-			const geometry = new THREE.CylinderGeometry(0.08, 0.08, 0.8, 6);
+			const geometry = new THREE.CylinderGeometry(0.08 * s, 0.08 * s, 0.8 * s, 6);
+			const emissiveBoost = s < 0.5 ? 0.8 : 0.4; // small ones glow brighter
 			const material = new THREE.MeshStandardMaterial({
 				color: 0x998877,
 				emissive: 0x554433,
-				emissiveIntensity: 0.4,
+				emissiveIntensity: emissiveBoost,
 			});
 			const mesh = new THREE.Mesh(geometry, material);
 			mesh.position.set(0, 0, zPosition);
@@ -986,8 +1141,8 @@ export function TunnelGame() {
 			return mesh;
 		};
 
-		const meshA = createShardMesh();
-		const meshB = createShardMesh();
+		const meshA = createShardMesh(scale);
+		const meshB = createShardMesh(scale);
 
 		// Place pair somewhere in the tunnel cross-section
 		const tunnelR = getTunnelRadius(Math.floor(-zPosition / 5));
@@ -1002,7 +1157,8 @@ export function TunnelGame() {
 		const behaviorA = behaviorSystemRef.current.register("quarkShard", posA, pairId);
 		const behaviorB = behaviorSystemRef.current.register("quarkShard", posB, pairId);
 
-		const baseRadius = 0.3 + Math.random() * 0.2; // 0.3-0.5 units — close but visible gap
+		const baseRadius = (0.3 + Math.random() * 0.2) * scale; // scales with size
+		const orbitSpeed = scale < 0.5 ? 4.0 + Math.random() * 2.0 : 2.5 + Math.random() * 1.5; // small ones spin faster
 
 		return {
 			meshA,
@@ -1012,13 +1168,13 @@ export function TunnelGame() {
 			orbitAngle: Math.random() * Math.PI * 2,
 			orbitRadius: baseRadius,
 			baseOrbitRadius: baseRadius,
-			orbitSpeed: 1.2 + Math.random() * 0.8, // 1.2-2.0 rad/s — slow ominous tumble
+			orbitSpeed,
 			centerX,
 			centerY,
 			driftPhase: "orbit",
 			driftStartTime: 0,
-			nextDriftTime: Date.now() + 5000 + Math.random() * 8000, // first drift 5-13s after spawn
-			maxDriftRadius: baseRadius * 3 + Math.random() * baseRadius * 2, // 3-5x base for the confinement snap
+			nextDriftTime: Date.now() + 2000 + Math.random() * 4000,
+			maxDriftRadius: baseRadius * 3 + Math.random() * baseRadius * 2,
 			behaviorA,
 			behaviorB,
 		};
@@ -1031,7 +1187,7 @@ export function TunnelGame() {
 		const numObstacles = 6 + Math.floor(Math.random() * 13); // 6-18
 		const corkscrewRadius = getTunnelRadius(Math.floor(-startZ / 5)) * 0.5;
 		const zSpacing = 1.5 + Math.random() * 3.5; // 1.5-5.0 units apart
-		const rotSpeed = 0.5 + Math.random() * 3.5; // 0.5-4.0 rad/s
+		const rotSpeed = 0.5 + Math.random() * 2.0; // 0.5-2.5 rad/s
 
 		// Create flyby audio for this group
 		const flybyAudio = new Audio(flybyAudioFile);
@@ -1139,6 +1295,7 @@ export function TunnelGame() {
 	const fireProjectile = () => {
 		if (!spaceshipRef.current || !sceneRef.current) return;
 		const now = Date.now();
+		if (now - gameStateRef.current.timeStarted < 10000) return; // no flares for first 10s
 		if (now - lastFlareTimeRef.current < pilotRef.current.flareCooldown * 1000) return;
 		lastFlareTimeRef.current = now;
 
@@ -1224,17 +1381,52 @@ export function TunnelGame() {
 			if (pilot.autopilot) {
 				const timeSinceManual = Date.now() - manualOverrideRef.current;
 				const autopilotStrength = Math.min(1, timeSinceManual / 1000); // fade in over 1s after keys released
+				const pilotStyle = pilot.pilotStyle ?? "cautious";
+				const isInvestigating = pilotStyle === "bold" || pilotStyle === "aggressive";
 
 				if (autopilotStrength > 0.01) {
 					const shipPos = spaceshipRef.current.position;
 					const ap = autopilotVelRef.current;
+					const now = Date.now();
 
-					// Find nearest threat directly in our path
+					// Bold/Aggressive: manage investigation target
+					let activeInvestigation = false;
+					if (isInvestigating) {
+						const bt = boldTargetRef.current;
+						if (!bt || now > bt.nextPickTime) {
+							const candidates: { x: number; y: number; z: number }[] = [];
+							obstaclesRef.current.forEach((o) => {
+								const z = o.mesh.position.z;
+								if (z < -5 && z > -30) candidates.push({ x: o.mesh.position.x, y: o.mesh.position.y, z });
+							});
+							rollingSpheresRef.current.forEach((s) => {
+								const z = s.mesh.position.z;
+								if (z < -5 && z > -30) candidates.push({ x: s.mesh.position.x, y: s.mesh.position.y, z });
+							});
+							quarkPairsRef.current.forEach((p) => {
+								if (p.zPosition < -5 && p.zPosition > -30) candidates.push({ x: p.centerX, y: p.centerY, z: p.zPosition });
+							});
+							if (candidates.length > 0) {
+								const pick = candidates[Math.floor(Math.random() * candidates.length)];
+								boldTargetRef.current = { x: pick.x, y: pick.y, z: pick.z, nextPickTime: now + 12000 + Math.random() * 6000, peelOff: false, peelStart: 0 };
+							} else {
+								boldTargetRef.current = null;
+							}
+						}
+						if (boldTargetRef.current && !boldTargetRef.current.peelOff) {
+							activeInvestigation = true;
+						}
+					} else {
+						boldTargetRef.current = null;
+					}
+
+					// Threat detection — aggressive reduces dodge zone during investigation
+					const dangerZone = (pilotStyle === "aggressive" && activeInvestigation) ? 4 : 8;
+					const dangerXY = (pilotStyle === "aggressive" && activeInvestigation) ? 1.0 : 2.0;
+
 					let nearestDist = Infinity;
 					let threatX = 0;
 					let threatY = 0;
-					const dangerZone = 8;
-					const dangerXY = 2.0;
 
 					const checkThreat = (tx: number, ty: number, tz: number) => {
 						if (tz > 0 || tz < -dangerZone) return;
@@ -1273,11 +1465,44 @@ export function TunnelGame() {
 						}
 					}
 
-					// Gentle center pull when clear
-					if (nearestDist === Infinity) {
-						desiredX -= shipPos.x * 0.5;
-						desiredY -= shipPos.y * 0.5;
+					// Bold/Aggressive investigation: approach target, peel off when close
+					if (isInvestigating && boldTargetRef.current) {
+						const target = boldTargetRef.current;
+						if (!target.peelOff) {
+							const toX = target.x - shipPos.x;
+							const toY = target.y - shipPos.y;
+							const toDist = Math.sqrt(toX * toX + toY * toY);
+
+							if (toDist > 0.5) {
+								// Approach the entity
+								desiredX += (toX / toDist) * 4;
+								desiredY += (toY / toDist) * 4;
+							} else {
+								// Peel off — bank away with a tilt
+								target.peelOff = true;
+								target.peelStart = now;
+								target.nextPickTime = now + 3000 + Math.random() * 4000;
+								const peelDir = toX > 0 ? -1 : 1;
+								knockbackRef.current.spin = peelDir * 2.5;
+							}
+						} else {
+							// Peeling off — swing away for 1.5s
+							const peelElapsed = (now - target.peelStart) / 1000;
+							if (peelElapsed < 1.5) {
+								const awayX = shipPos.x - target.x;
+								const awayY = shipPos.y - target.y;
+								const awayDist = Math.sqrt(awayX * awayX + awayY * awayY) || 1;
+								const peelForce = 4 * (1 - peelElapsed / 1.5);
+								desiredX += (awayX / awayDist) * peelForce;
+								desiredY += (awayY / awayDist) * peelForce;
+							}
+						}
 					}
+
+					// Center pull
+					const centerStrength = nearestDist === Infinity ? 0.8 : 0.3;
+					desiredX -= shipPos.x * centerStrength;
+					desiredY -= shipPos.y * centerStrength;
 
 					const blend = 2.0 * deltaTime;
 					ap.x += (desiredX - ap.x) * blend;
@@ -1285,6 +1510,21 @@ export function TunnelGame() {
 
 					spaceshipRef.current.position.x += ap.x * deltaTime * autopilotStrength;
 					spaceshipRef.current.position.y += ap.y * deltaTime * autopilotStrength;
+
+					// Auto-flare: fire occasionally when calm, dark, and flying straight
+					const isCalm = nearestDist > 6; // no nearby threats
+					const isStraight = Math.abs(knockbackRef.current.spin) < 0.3; // not banking
+					const shipDist = Math.sqrt(spaceshipRef.current.position.x ** 2 + spaceshipRef.current.position.y ** 2);
+					const isCentered = shipDist < 1.5; // near tunnel center
+					const speed2d = Math.sqrt(ap.x * ap.x + ap.y * ap.y);
+					const isCoasting = speed2d < 1.5; // not dodging hard
+					const flareGap = now - lastFlareTimeRef.current > 15000; // at least 15s since last
+					if (isCalm && isStraight && isCentered && flareGap) {
+						// 15% chance per second when conditions met
+						if (Math.random() < 0.15 * deltaTime) {
+							fireProjectile();
+						}
+					}
 				}
 			} else if (!hasManualInput) {
 				// No autopilot, no manual input — nothing to do
@@ -1300,6 +1540,15 @@ export function TunnelGame() {
 			kb.vx *= 0.95;
 			kb.vy *= 0.95;
 		}
+
+		// Hard clamp — never let ship outside tunnel wall regardless of knockback or bounce
+		const clampDist = Math.sqrt(spaceshipRef.current.position.x ** 2 + spaceshipRef.current.position.y ** 2);
+		const maxDist = tunnelRadius - 0.1;
+		if (clampDist > maxDist) {
+			const clampAngle = Math.atan2(spaceshipRef.current.position.y, spaceshipRef.current.position.x);
+			spaceshipRef.current.position.x = Math.cos(clampAngle) * maxDist;
+			spaceshipRef.current.position.y = Math.sin(clampAngle) * maxDist;
+		}
 		if (Math.abs(kb.spin) > 0.01) {
 			spaceshipRef.current.rotation.z += kb.spin * deltaTime;
 			kb.spin *= 0.96;
@@ -1308,24 +1557,34 @@ export function TunnelGame() {
 			spaceshipRef.current.rotation.z *= 0.92;
 		}
 
-		// Constrain spaceship to tunnel — bounce off walls with knockback + camera shake
-		const distFromCenter = Math.sqrt(
-			spaceshipRef.current.position.x ** 2 + spaceshipRef.current.position.y ** 2
-		);
-		if (distFromCenter > tunnelRadius) {
-			const angle = Math.atan2(spaceshipRef.current.position.y, spaceshipRef.current.position.x);
-			// Push back inside
-			spaceshipRef.current.position.x = Math.cos(angle) * (tunnelRadius - 0.15);
-			spaceshipRef.current.position.y = Math.sin(angle) * (tunnelRadius - 0.15);
-			// Bounce inward — strength based on how fast you were going outward
-			const bounceStrength = 4 + Math.abs(kb.vx + kb.vy) * 0.3;
-			knockbackRef.current.vx = -Math.cos(angle) * bounceStrength;
-			knockbackRef.current.vy = -Math.sin(angle) * bounceStrength;
-			knockbackRef.current.spin += (Math.random() - 0.5) * 3;
-			// Camera shake
-			cameraShakeRef.current = 0.15;
-			// Subtle flash
-			setGameState((prev) => ({ ...prev, damageFlash: 0.1 }));
+		// Wall bounce — sustained inward push, no teleporting
+		if (wallBounceRef.current > 0) {
+			// Currently bouncing — push ship toward center
+			const bx = spaceshipRef.current.position.x;
+			const by = spaceshipRef.current.position.y;
+			const bDist = Math.sqrt(bx * bx + by * by);
+			if (bDist > 0.1) {
+				const pushStrength = 8 * (wallBounceRef.current / 0.6); // stronger at start, eases off
+				spaceshipRef.current.position.x -= (bx / bDist) * pushStrength * deltaTime;
+				spaceshipRef.current.position.y -= (by / bDist) * pushStrength * deltaTime;
+			}
+			wallBounceRef.current = Math.max(0, wallBounceRef.current - deltaTime);
+		} else {
+			// Check for wall collision
+			const distFromCenter = Math.sqrt(
+				spaceshipRef.current.position.x ** 2 + spaceshipRef.current.position.y ** 2
+			);
+			if (distFromCenter > tunnelRadius) {
+				const angle = Math.atan2(spaceshipRef.current.position.y, spaceshipRef.current.position.x);
+				// Clamp to just inside the wall (no teleport — just prevent clipping)
+				spaceshipRef.current.position.x = Math.cos(angle) * (tunnelRadius - 0.05);
+				spaceshipRef.current.position.y = Math.sin(angle) * (tunnelRadius - 0.05);
+				// Start bounce — 0.6 seconds of sustained inward push
+				wallBounceRef.current = 0.6;
+				// Tilt away from the wall
+				spaceshipRef.current.rotation.z += (-angle > 0 ? 1 : -1) * 0.25;
+				knockbackRef.current.spin = (-angle > 0 ? 1 : -1) * 1.5;
+			}
 		}
 
 		// Update tunnel segments — move them all forward, recycle any that pass the camera
@@ -1346,6 +1605,7 @@ export function TunnelGame() {
 				const newZ = minZ - 5;
 				const newIndex = Math.round(-newZ / 5);
 
+				disposeMesh(segments[i]);
 				sceneRef.current?.remove(segments[i]);
 				const newSegment = createTunnelSegment(newIndex);
 				newSegment.position.z = newZ;
@@ -1358,21 +1618,16 @@ export function TunnelGame() {
 		const pm = playlistManagerRef.current;
 		const bassRaw = pm ? pm.getBassEnergy() : 0;
 		const midRaw = pm ? pm.getMidEnergy() : 0;
-		// Heavy smoothing for organic "bop" feel — slow rise, slow fall
-		const prevBass = bassEnergyRef.current;
-		const bassBlend = bassRaw > prevBass ? 0.08 : 0.04; // rise slightly faster than fall
-		bassEnergyRef.current += (bassRaw - prevBass) * bassBlend;
+		const trebleRaw = pm ? pm.getTrebleEnergy() : 0;
+		// Light smoothing for responsive display & entity effects
+		bassEnergyRef.current += (bassRaw - bassEnergyRef.current) * 0.3;
+		midEnergyRef.current += (midRaw - midEnergyRef.current) * 0.35;
+		trebleEnergyRef.current += (trebleRaw - trebleEnergyRef.current) * 0.4;
 		audioAmplitudeRef.current = midRaw > 0.01
 			? 0.3 + midRaw * 0.4
 			: 0.3 + 0.2 * Math.sin(Date.now() / 500); // fallback sine when no audio
 
-		// Detect amplitude spikes for cube pulse
 		const reactivity = pilot.musicReactivity ?? 1.0;
-		const combinedEnergy = bassRaw * 0.6 + midRaw * 0.4;
-		// Use raw energy delta (not smoothed) so spikes are actually detected
-		const spike = Math.max(0, combinedEnergy - prevBass - 0.02);
-		// Slower decay (0.92) so pulse is visible longer, stronger attack
-		spikeRef.current = Math.max(spikeRef.current * 0.92, spike * 5 * reactivity);
 
 
 		const currentTime = Date.now();
@@ -1389,20 +1644,47 @@ export function TunnelGame() {
 			activeFlarePositions: projectilesRef.current
 				.filter((p) => p.hasIgnited)
 				.map((p) => p.mesh.position),
-			quarkShardPositions: quarkPairsRef.current.flatMap((pair) => {
-				const center = new THREE.Vector3(pair.centerX, pair.centerY, pair.zPosition);
-				return [center];
-			}),
+			quarkShardPositions: (() => {
+				const pool = quarkPosPoolRef.current;
+				const pairs = quarkPairsRef.current;
+				// Grow pool if needed, reuse existing vectors
+				while (pool.length < pairs.length) pool.push(new THREE.Vector3());
+				for (let i = 0; i < pairs.length; i++) {
+					pool[i].set(pairs[i].centerX, pairs[i].centerY, pairs[i].zPosition);
+				}
+				return pool.slice(0, pairs.length);
+			})(),
+			trebleEnergy: trebleEnergyRef.current,
 			globalMood: { avgAnger: 0, avgFear: 0, avgExcitement: 0 },
 		};
 		behaviorSystemRef.current.update(behaviorCtx);
 
-		// Spawn obstacles - starts sparse, increases gradually
-		// Level 1: ~1.5% chance, Level 5: ~3.5% chance, Level 10: ~6% chance
+		// When a murmuration just triggered, spawn extra motes in the recruitment zone
+		// to double the cloud density
+		if (didMurmurationJustTrigger()) {
+			const extraCount = motesRef.current.filter(
+				(m) => m.mesh.position.z < -35 && m.mesh.position.z > -65
+			).length;
+			for (let i = 0; i < extraCount; i++) {
+				const z = -35 - Math.random() * 30;
+				const mote = createMote(z);
+				motesRef.current.push(mote);
+			}
+		}
+
+		const currentTimeSurvived = (Date.now() - state.timeStarted) / 1000;
+		const yearsLived = Math.floor(currentTimeSurvived / 60);
+
+		// Spawn cloud beings — none before 20s, with brief periodic thinning
 		const density = pilot.entityDensity;
-		const baseSpawnChance = 0.015;
-		const spawnChanceIncrease = state.level * 0.005;
-		const spawnChance = Math.min(0.08, baseSpawnChance + spawnChanceIncrease) * density;
+		// Scale spawns by speed so tunnel density stays consistent at any velocity
+		const speedScale = speed / baseSpeed;
+		// Single slow wave: brief dip to 30% spawn rate every ~40s
+		const spawnWave = Math.sin(currentTimeSurvived * 0.16);
+		const spawnDensityMod = spawnWave < -0.7 ? 0.3 : 1.0;
+		const spawnChance = currentTimeSurvived >= 20
+			? Math.min(0.04, 0.015 + yearsLived * 0.002) * density * spawnDensityMod * speedScale
+			: 0;
 
 		if (Math.random() < spawnChance) {
 			const obstacle = createObstacle(-50);
@@ -1410,14 +1692,12 @@ export function TunnelGame() {
 		}
 
 		// Spawn atmospheric motes - constant gentle flow
-		if (Math.random() < 0.08 * density) {
+		if (Math.random() < 0.08 * density * speedScale) {
 			const mote = createMote(-50);
 			motesRef.current.push(mote);
 		}
 
 		// Spawn corkscrew groups - only after year 1, then once per year
-		const currentTimeSurvived = (Date.now() - state.timeStarted) / 1000;
-		const yearsLived = Math.floor(currentTimeSurvived / 60);
 
 		// Track last corkscrew spawn time
 		if (!lastCorkscrewSpawnRef.current) {
@@ -1431,39 +1711,60 @@ export function TunnelGame() {
 			&& corkscrewGroupsRef.current.length === 0
 			&& timeSinceLastCorkscrew >= 60;
 
-		if (shouldSpawnCorkscrew) {
+		// Check if any quark pair is within 20 units of the spawn zone
+		const quarkNearSpawn = quarkPairsRef.current.some((p) => p.zPosition < -40);
+		if (shouldSpawnCorkscrew && !quarkNearSpawn) {
 			const group = createCorkscrewGroup(-60);
 			corkscrewGroupsRef.current.push(group);
 			lastCorkscrewSpawnRef.current = currentTimeSurvived;
 		}
 
-		// Spawn quark pairs — from 30s onwards, up to 2 active
-		if (currentTimeSurvived >= 30 && quarkPairsRef.current.length < 2 && Math.random() < 0.008 * density) {
-			const pair = createQuarkPair(-55 - Math.random() * 10);
-			quarkPairsRef.current.push(pair);
+		// Spawn quark pairs — two encounter types:
+		// 1. Cluster of 6 small pairs (scale 0.25) — more common
+		// 2. Single large pair (scale 1.0), occasionally 2 — rarer
+		// Don't spawn if a corkscrew is nearby
+		const corkscrewNearSpawn = corkscrewGroupsRef.current.some((g) =>
+			g.obstacles.some((o) => o.zPosition < -40)
+		);
+		const smallCount = quarkPairsRef.current.filter((p) => (p.meshA.scale?.x ?? 1) < 0.5 || p.baseOrbitRadius < 0.15).length;
+		const largeCount = quarkPairsRef.current.length - smallCount;
+		if (currentTimeSurvived >= 60 && !corkscrewNearSpawn && Math.random() < 0.003 * density * speedScale) {
+			const isSmallCluster = Math.random() < 0.65; // 65% chance small cluster
+			if (isSmallCluster && smallCount < 6) {
+				// Spawn cluster of 6 small pairs near each other
+				const baseZ = -55 - Math.random() * 10;
+				const tunnelR = getTunnelRadius(Math.floor(-baseZ / 5));
+				const clusterAngle = Math.random() * Math.PI * 2;
+				const clusterR = (0.15 + Math.random() * 0.3) * tunnelR;
+				for (let ci = 0; ci < 6; ci++) {
+					const offsetAngle = clusterAngle + (ci / 6) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
+					const offsetR = clusterR * (0.6 + Math.random() * 0.4);
+					const pair = createQuarkPair(baseZ + (Math.random() - 0.5) * 3, 0.25);
+					// Reposition to cluster location
+					pair.centerX = Math.cos(offsetAngle) * offsetR;
+					pair.centerY = Math.sin(offsetAngle) * offsetR;
+					quarkPairsRef.current.push(pair);
+				}
+			} else if (!isSmallCluster && largeCount < 2) {
+				const pair = createQuarkPair(-55 - Math.random() * 10, 1.0);
+				quarkPairsRef.current.push(pair);
+			}
 		}
 
 		// Spawn rolling spheres - frequency based on current year
-		// Year 1: only 1 (and not before 30 seconds)
-		// Year 2: 2 total
-		// Year 3: 3 total
-		// Year 4+: random 1-6 per year
+		// Rolling spheres: none before 90s, then ramp up
 		const activeRollingSpheres = rollingSpheresRef.current.length;
 		let targetRollingSpheres = 0;
 
-		if (yearsLived === 0) {
-			// First year (0-60 seconds): only 1 sphere, and only after 30 seconds
-			if (currentTimeSurvived >= 30) {
-				targetRollingSpheres = 1;
-			}
-		} else if (yearsLived === 1) {
-			// Second year: 2 spheres
-			targetRollingSpheres = 2;
+		if (currentTimeSurvived < 90) {
+			targetRollingSpheres = 0;
+		} else if (yearsLived <= 1) {
+			targetRollingSpheres = 0;
 		} else if (yearsLived === 2) {
-			// Third year: 3 spheres
-			targetRollingSpheres = 3;
+			targetRollingSpheres = 1;
+		} else if (yearsLived === 3) {
+			targetRollingSpheres = 2;
 		} else {
-			// Year 4+: random 1-6 spheres
 			targetRollingSpheres = 1 + Math.floor(Math.random() * 6);
 		}
 
@@ -1482,6 +1783,7 @@ export function TunnelGame() {
 
 			// Remove if behind camera
 			if (sphere.mesh.position.z > 5) {
+				disposeMesh(sphere.mesh);
 				sceneRef.current?.remove(sphere.mesh);
 				return false;
 			}
@@ -1489,9 +1791,10 @@ export function TunnelGame() {
 			// Update angle for spiral motion around the tunnel
 			sphere.angle += sphere.angularVelocity * deltaTime;
 
-			// Update radius based on current tunnel segment
-			const currentTunnelRadius = getTunnelRadius(Math.floor(-sphere.zPosition / 5));
-			const baseRadius = currentTunnelRadius * 0.8;
+			// Position sphere so its outer edge touches the tunnel wall
+			// Use base radius 5 (ignore time fluctuation — tunnel geometry doesn't update in real-time)
+			const sphereVisualRadius = 0.4 * sphere.size;
+			const baseRadius = 5 - sphereVisualRadius * 0.85;
 
 			// Bass bounce — gentle inward "bop" that follows the beat
 			// Smooth energy drives a slow sine-like lift so spheres bob, not jerk
@@ -1532,11 +1835,12 @@ export function TunnelGame() {
 
 				// Rage spike from sphere collision
 				setGameState((prev) => {
-					const rageIncrease = 4 + Math.random() * 3;
-					return { ...prev, damageFlash: 0.5, rageLevel: Math.min(100, prev.rageLevel + rageIncrease) };
+					const rageIncrease = 3 + Math.random() * 3;
+					return { ...prev, damageFlash: 0.5, rageLevel: Math.min(100, prev.rageLevel + rageIncrease), collisionCount: prev.collisionCount + 1 };
 				});
 
 				// Remove the sphere on collision
+				disposeMesh(sphere.mesh);
 				sceneRef.current?.remove(sphere.mesh);
 				return false;
 			}
@@ -1555,6 +1859,8 @@ export function TunnelGame() {
 			if (pair.zPosition > 5) {
 				if (pair.behaviorA) behaviorSystemRef.current.unregister(pair.behaviorA);
 				if (pair.behaviorB) behaviorSystemRef.current.unregister(pair.behaviorB);
+				disposeMesh(pair.meshA);
+				disposeMesh(pair.meshB);
 				sceneRef.current?.remove(pair.meshA);
 				sceneRef.current?.remove(pair.meshB);
 				return false;
@@ -1562,54 +1868,55 @@ export function TunnelGame() {
 
 			const now = Date.now();
 
-			// Quark drift/snap state machine
-			if (pair.driftPhase === "orbit" && now >= pair.nextDriftTime) {
-				pair.driftPhase = "drifting";
-				pair.driftStartTime = now;
-			} else if (pair.driftPhase === "drifting") {
-				const driftDuration = 2500; // 2.5s to drift apart
-				const driftProgress = Math.min(1, (now - pair.driftStartTime) / driftDuration);
-				// Ease out — fast at first, slows down (like stretching a spring)
-				const ease = 1 - (1 - driftProgress) * (1 - driftProgress);
-				pair.orbitRadius = pair.baseOrbitRadius + (pair.maxDriftRadius - pair.baseOrbitRadius) * ease;
+			// Music energy drives the dance
+			const bass = bassEnergyRef.current;
+			const mid = midEnergyRef.current;
+			const treble = trebleEnergyRef.current;
 
-				if (driftProgress >= 1) {
-					pair.driftPhase = "snapping";
-					pair.driftStartTime = now;
-				}
-			} else if (pair.driftPhase === "snapping") {
-				const snapDuration = 300; // 0.3s snap back — sudden!
-				const snapProgress = Math.min(1, (now - pair.driftStartTime) / snapDuration);
-				// Ease in — accelerates (like a spring release)
-				const ease = snapProgress * snapProgress * snapProgress;
-				pair.orbitRadius = pair.maxDriftRadius - (pair.maxDriftRadius - pair.baseOrbitRadius) * ease;
+			// Radius breathes in and out — one full close-far-close cycle every ~4 seconds
+			const danceTime = (now - pair.birthTime) / 1000;
+			const breath = 0.5 + 0.5 * Math.sin(danceTime * 0.25 * Math.PI * 2);
+			pair.orbitRadius = pair.baseOrbitRadius + (pair.maxDriftRadius - pair.baseOrbitRadius) * breath;
 
-				if (snapProgress >= 1) {
-					pair.orbitRadius = pair.baseOrbitRadius;
-					pair.driftPhase = "orbit";
-					pair.nextDriftTime = now + 5000 + Math.random() * 8000; // next drift 5-13s
-				}
-			}
+			// Figure skater physics: spin faster when close, slower when far
+			// Conservation of angular momentum — inverse relationship with radius
+			const spinSpeed = pair.orbitSpeed * (pair.maxDriftRadius / Math.max(pair.orbitRadius, 0.3));
+			pair.orbitAngle += spinSpeed * deltaTime;
 
-			// Advance helix orbit
-			pair.orbitAngle += pair.orbitSpeed * deltaTime;
-
-			// Position each shard on opposite sides of the orbit
+			// Slightly elliptical orbit for organic feel
+			const ellipseRatio = 0.85;
 			const ax = pair.centerX + Math.cos(pair.orbitAngle) * pair.orbitRadius;
-			const ay = pair.centerY + Math.sin(pair.orbitAngle) * pair.orbitRadius;
+			const ay = pair.centerY + Math.sin(pair.orbitAngle) * pair.orbitRadius * ellipseRatio;
 			const bx = pair.centerX + Math.cos(pair.orbitAngle + Math.PI) * pair.orbitRadius;
-			const by = pair.centerY + Math.sin(pair.orbitAngle + Math.PI) * pair.orbitRadius;
+			const by = pair.centerY + Math.sin(pair.orbitAngle + Math.PI) * pair.orbitRadius * ellipseRatio;
 
 			pair.meshA.position.x = ax;
 			pair.meshA.position.y = ay;
 			pair.meshB.position.x = bx;
 			pair.meshB.position.y = by;
 
-			// Slow ominous tumble — each shard rotates lazily
-			pair.meshA.rotation.x += deltaTime * 0.8;
-			pair.meshA.rotation.z += deltaTime * 0.5;
-			pair.meshB.rotation.x -= deltaTime * 0.6;
-			pair.meshB.rotation.z -= deltaTime * 0.9;
+			// Tumble together — each rod rolls on all axes at different rates
+			// Faster tumble when spinning fast (close together)
+			const tumbleBase = 1.2 + (pair.maxDriftRadius / Math.max(pair.orbitRadius, 0.3)) * 0.4;
+			pair.meshA.rotation.x += deltaTime * tumbleBase * 0.9;
+			pair.meshA.rotation.y += deltaTime * tumbleBase * 0.6;
+			pair.meshA.rotation.z += deltaTime * tumbleBase * 0.4;
+			pair.meshB.rotation.x -= deltaTime * tumbleBase * 0.7;
+			pair.meshB.rotation.y -= deltaTime * tumbleBase * 1.1;
+			pair.meshB.rotation.z += deltaTime * tumbleBase * 0.5;
+
+			// Emissive glow pulses with treble — shimmer on high frequencies
+			const glowIntensity = 0.2 + treble * 0.8;
+			pair.meshA.traverse((child) => {
+				if (child instanceof THREE.Mesh && child.material) {
+					(child.material as THREE.MeshStandardMaterial).emissiveIntensity = glowIntensity;
+				}
+			});
+			pair.meshB.traverse((child) => {
+				if (child instanceof THREE.Mesh && child.material) {
+					(child.material as THREE.MeshStandardMaterial).emissiveIntensity = glowIntensity;
+				}
+			});
 
 			// Sync behavior positions
 			if (pair.behaviorA) {
@@ -1696,6 +2003,8 @@ export function TunnelGame() {
 				// Remove the original pair
 				if (pair.behaviorA) behaviorSystemRef.current.unregister(pair.behaviorA);
 				if (pair.behaviorB) behaviorSystemRef.current.unregister(pair.behaviorB);
+				disposeMesh(pair.meshA);
+				disposeMesh(pair.meshB);
 				sceneRef.current?.remove(pair.meshA);
 				sceneRef.current?.remove(pair.meshB);
 
@@ -1716,6 +2025,8 @@ export function TunnelGame() {
 		shatterFragmentsRef.current = shatterFragmentsRef.current.filter((frag) => {
 			const age = Date.now() - frag.birthTime;
 			if (age > SHATTER_LIFETIME) {
+				disposeMesh(frag.meshA);
+				disposeMesh(frag.meshB);
 				sceneRef.current?.remove(frag.meshA);
 				sceneRef.current?.remove(frag.meshB);
 				return false;
@@ -1826,6 +2137,7 @@ export function TunnelGame() {
 				group.obstacles.forEach((obs) => {
 					const beh = (obs.mesh as unknown as { _behavior?: BehaviorState })?._behavior;
 					if (beh) behaviorSystemRef.current.unregister(beh);
+					disposeMesh(obs.mesh);
 					sceneRef.current?.remove(obs.mesh);
 				});
 				// Stop the flyby audio
@@ -1848,6 +2160,7 @@ export function TunnelGame() {
 				if (obstacle.mesh.position.z > 5) {
 					const beh = (obstacle.mesh as unknown as { _behavior?: BehaviorState })?._behavior;
 					if (beh) behaviorSystemRef.current.unregister(beh);
+					disposeMesh(obstacle.mesh);
 					sceneRef.current?.remove(obstacle.mesh);
 					return false;
 				}
@@ -1926,13 +2239,14 @@ export function TunnelGame() {
 							motesRef.current.push(explosionMote);
 						}
 						// Remove the obstacle mesh
+						disposeMesh(obs.mesh);
 						sceneRef.current?.remove(obs.mesh);
 					});
 
 					// RAGE SPIKE from corkscrew explosion
 					setGameState((prev) => {
 						const rageSpike = 20 + Math.random() * 10;
-						return { ...prev, damageFlash: 0.8, rageLevel: Math.min(100, prev.rageLevel + rageSpike) };
+						return { ...prev, damageFlash: 0.8, rageLevel: Math.min(100, prev.rageLevel + rageSpike), collisionCount: prev.collisionCount + 1 };
 					});
 
 					return false; // Remove this obstacle
@@ -1946,6 +2260,7 @@ export function TunnelGame() {
 				group.obstacles.forEach((obs) => {
 					const beh = (obs.mesh as unknown as { _behavior?: BehaviorState })?._behavior;
 					if (beh) behaviorSystemRef.current.unregister(beh);
+					disposeMesh(obs.mesh);
 					sceneRef.current?.remove(obs.mesh);
 				});
 				// Stop the flyby audio
@@ -1973,6 +2288,7 @@ export function TunnelGame() {
 			// Remove if behind camera
 			if (obstacle.mesh.position.z > 5) {
 				if (obstacle.behavior) behaviorSystemRef.current.unregister(obstacle.behavior);
+				disposeMesh(obstacle.mesh);
 				sceneRef.current?.remove(obstacle.mesh);
 				return false;
 			}
@@ -1983,10 +2299,9 @@ export function TunnelGame() {
 				obstacle.mesh.position.y = obstacle.behavior.position.y;
 			}
 
-			// Music pulse — cubes breathe with bass + twitch on spikes
-			const bassPulse = bassEnergyRef.current * 0.15 * reactivity; // gentle swell with bass
-			const spikePulse = spikeRef.current * 0.6; // visible pop on amplitude spikes
-			const pulse = 1 + bassPulse + spikePulse;
+			// Music pulse — cubes breathe with mid-frequency energy
+			const midPulse = midEnergyRef.current * 0.6 * reactivity;
+			const pulse = 1 + midPulse;
 			obstacle.mesh.scale.set(pulse, pulse, pulse);
 
 			// Slow rolling rotation
@@ -1995,9 +2310,10 @@ export function TunnelGame() {
 			obstacle.mesh.rotation.y += rollSpeed * deltaTime * 0.7;
 			obstacle.mesh.rotation.z += rollSpeed * deltaTime * 0.5;
 
-			// Check collision with spaceship
+			// Check collision with spaceship (1s cooldown per obstacle)
 			const dist = obstacle.mesh.position.distanceTo(spaceshipRef.current!.position);
-			if (dist < 0.6) {
+			if (dist < 0.6 && currentTime - obstacle.lastCollisionTime > 1000) {
+				obstacle.lastCollisionTime = currentTime;
 				playCollisionSound();
 
 				// Make cloud being angry via mood system
@@ -2020,40 +2336,44 @@ export function TunnelGame() {
 
 				setGameState((prev) => {
 					const rageIncrease = 5 + Math.random() * 4;
-					return { ...prev, damageFlash: 0.3, rageLevel: Math.min(100, prev.rageLevel + rageIncrease) };
+					return { ...prev, damageFlash: 0.3, rageLevel: Math.min(100, prev.rageLevel + rageIncrease), collisionCount: prev.collisionCount + 1 };
 				});
 			}
 
-			// Anger visuals — scaled by global rage so low-rage hits are subtle
-			const rageScale = Math.max(0.15, state.rageLevel / 100); // at least 15% visible
+			// Anger visuals
 			if (obstacle.angerLevel > 0) {
 				const timeSinceAnger = (currentTime - obstacle.angerTime) / 1000;
 				obstacle.angerLevel = Math.max(0, 1 - timeSinceAnger / 6);
 			}
 			const moodAnger = obstacle.behavior?.mood.anger ?? 0;
-			const rawAnger = Math.max(obstacle.angerLevel, moodAnger, state.rageLevel / 100);
-			const effectiveAnger = rawAnger * rageScale;
+			// Global rage provides a baseline anger (up to 0.5 at 100% rage)
+			const rageBaseline = (state.rageLevel / 100) * 0.5;
+			const rawAnger = Math.max(obstacle.angerLevel, moodAnger, rageBaseline);
 
-			// Always update color — reset to base when calm, blend toward red when angry
+			// Color: subtle warm shift, max 30% toward red
+			const colorAnger = Math.min(0.3, rawAnger * 0.3);
+			// Slow emissive glow — only activates above 60% rage, max 20% intensity
+			// ~8 second cycle with smooth sine, per-entity phase offset
+			const ragePercent = state.rageLevel / 100;
+			const glowFactor = ragePercent > 0.6 ? (ragePercent - 0.6) / 0.4 : 0; // 0 at 60%, 1 at 100%
+			// Narrow oscillation band: ranges 0.6–1.0 so it never fully turns off
+			// ~10 second cycle for slow menacing pulse, per-entity phase offset
+			const glowWave = 0.7 + 0.3 * Math.sin(currentTime / 5000 + obstacle.birthTime * 0.001);
+			const emissiveStrength = glowFactor * glowWave * 0.2;
+
 			obstacle.mesh.traverse((child) => {
 				if (child instanceof THREE.Mesh && child.material) {
 					const material = child.material as THREE.MeshStandardMaterial;
 					const baseColor = new THREE.Color(0x8b6f47);
 					const angryColor = new THREE.Color(0xff3333);
-					material.color.lerpColors(baseColor, angryColor, effectiveAnger);
-					material.emissive.setRGB(effectiveAnger * 0.3, 0, 0);
+					material.color.lerpColors(baseColor, angryColor, colorAnger);
+					material.emissive.setRGB(emissiveStrength, 0, 0);
 				}
 			});
 
-			// Vibration and scale use rawAnger so the momentary pulse is always visible
-			if (rawAnger > 0.01) {
-				const vibrationAmount = rawAnger * 0.15;
-				obstacle.mesh.position.x += Math.sin(currentTime / 50) * vibrationAmount;
-				obstacle.mesh.position.y += Math.cos(currentTime / 50) * vibrationAmount;
-			}
-
-			const angryScale = 1 + rawAnger * 0.5;
-			const combinedPulse = (1 + bassPulse + spikePulse) * angryScale;
+			// Scale: music pulse + mild angry swell (no vibration)
+			const angryScale = 1 + rawAnger * 0.2;
+			const combinedPulse = (1 + midPulse) * angryScale;
 			obstacle.mesh.scale.set(combinedPulse, combinedPulse, combinedPulse);
 
 			return true;
@@ -2098,6 +2418,7 @@ export function TunnelGame() {
 
 				if (timeSinceIgnition > burnDuration) {
 					// Flare has burned out, remove it
+					disposeMesh(projectile.mesh);
 					sceneRef.current?.remove(projectile.mesh);
 					sceneRef.current?.remove(projectile.light);
 					return false;
@@ -2135,6 +2456,7 @@ export function TunnelGame() {
 				});
 
 				if (hit) {
+					disposeMesh(projectile.mesh);
 					sceneRef.current?.remove(projectile.mesh);
 					sceneRef.current?.remove(projectile.light);
 					return false;
@@ -2172,6 +2494,7 @@ export function TunnelGame() {
 			// Remove if behind camera
 			if (mote.mesh.position.z > 5) {
 				if (mote.behavior) behaviorSystemRef.current.unregister(mote.behavior);
+				disposeMesh(mote.mesh);
 				sceneRef.current?.remove(mote.mesh);
 				return false;
 			}
@@ -2205,8 +2528,99 @@ export function TunnelGame() {
 			// Brighten opacity when lit
 			material.opacity = Math.min(1.0, 0.7 + nearbyLightBoost * 0.3);
 
+			// Mote-ship collision — trigger relay wave
+			const moteDist = mote.mesh.position.distanceTo(spaceshipRef.current!.position);
+			if (moteDist < 0.4 && !moteRelayRef.current) {
+				// Start a relay wave from the ship's position
+				const shipZ = spaceshipRef.current!.position.z;
+				moteRelayRef.current = {
+					startTime: currentTime,
+					startZ: shipZ,
+					prevWavefrontZ: shipZ,
+					visited: new Set(),
+				};
+				// Anger this mote as the origin
+				if (mote.behavior) mote.behavior.mood.anger = 1.0;
+				relayMotesRef.current.set(mote, currentTime);
+				// Small ship bump from mote contact
+				const mdx = spaceshipRef.current!.position.x - mote.mesh.position.x;
+				const mdy = spaceshipRef.current!.position.y - mote.mesh.position.y;
+				const mdd = Math.sqrt(mdx * mdx + mdy * mdy) || 1;
+				knockbackRef.current.vx += (mdx / mdd) * 1.5;
+				knockbackRef.current.vy += (mdy / mdd) * 1.5;
+				knockbackRef.current.spin += (Math.random() - 0.5) * 1.2;
+				// Bump rage — the aliens noticed you
+				setGameState((prev) => ({
+					...prev,
+					rageLevel: Math.min(100, prev.rageLevel + 3),
+				}));
+			}
+
+			// Anger visuals — blend from warm cream to red, then decay
+			const moteAnger = mote.behavior?.mood.anger ?? 0;
+			if (moteAnger > 0.01) {
+				const baseColor = new THREE.Color(0xfff8e8);
+				const angryColor = new THREE.Color(0xff3333);
+				material.color.lerpColors(baseColor, angryColor, moteAnger);
+				material.emissive.lerpColors(new THREE.Color(0xffeab3), new THREE.Color(0xff1111), moteAnger);
+				material.emissiveIntensity = Math.min(3.0, basePulse + nearbyLightBoost + moteAnger * 2);
+			} else {
+				material.color.set(0xfff8e8);
+				material.emissive.set(0xffeab3);
+			}
+
 			return true;
 		});
+
+		// Update mote relay wave — continuous wavefront, 50% of motes
+		if (moteRelayRef.current) {
+			const relay = moteRelayRef.current;
+			const relayElapsed = (currentTime - relay.startTime) / 1000;
+			const relaySpeed = 25; // z-units per second
+			const wavefrontZ = relay.startZ - relayElapsed * relaySpeed;
+			const maxDistance = 100;
+
+			if (relayElapsed * relaySpeed > maxDistance) {
+				moteRelayRef.current = null;
+			} else {
+				// Sweep all motes between previous wavefront and current wavefront
+				for (const m of motesRef.current) {
+					if (relay.visited.has(m)) continue;
+					const mz = m.mesh.position.z;
+					// Mote is behind the wavefront but ahead of (or at) previous position
+					if (mz <= relay.prevWavefrontZ && mz >= wavefrontZ) {
+						relay.visited.add(m);
+						// 50% chance to join the wave
+						if (Math.random() < 0.5 && m.behavior) {
+							m.behavior.mood.anger = 1.0;
+							relayMotesRef.current.set(m, currentTime);
+						}
+					}
+				}
+				relay.prevWavefrontZ = wavefrontZ;
+			}
+		}
+
+		// Relay motes: hold full red for 1s, then fade over ~2s
+		if (relayMotesRef.current.size > 0) {
+			const holdDuration = 0.6; // seconds at full red
+			for (const [m, angeredAt] of relayMotesRef.current) {
+				if (!m.behavior) {
+					relayMotesRef.current.delete(m);
+					continue;
+				}
+				const elapsed = (currentTime - angeredAt) / 1000;
+				const fadeDuration = 0.3;
+				if (elapsed < holdDuration) {
+					m.behavior.mood.anger = 1.0;
+				} else if (elapsed < holdDuration + fadeDuration) {
+					m.behavior.mood.anger = 1.0 - (elapsed - holdDuration) / fadeDuration;
+				} else {
+					m.behavior.mood.anger = 0;
+					relayMotesRef.current.delete(m);
+				}
+			}
+		}
 
 		// Camera follows spaceship - adjusted for better tunnel visibility
 		cameraRef.current.position.x = spaceshipRef.current.position.x * 0.2;
@@ -2233,24 +2647,6 @@ export function TunnelGame() {
 			proximitySoundRef.current.volume = Math.max(0, Math.min(1, newVolume));
 		}
 
-		// Calculate rage level from environment
-		// Sum up all obstacle anger levels and recent incidents
-		let totalAnger = 0;
-		let angryObstacleCount = 0;
-
-		obstaclesRef.current.forEach((obstacle) => {
-			if (obstacle.angerLevel > 0) {
-				totalAnger += obstacle.angerLevel;
-				angryObstacleCount++;
-			}
-		});
-
-		// Calculate target rage level (0-100)
-		// Base rage on: number of angry obstacles + their combined anger
-		const angryObstacleFactor = Math.min(50, angryObstacleCount * 5); // Up to 50 from count
-		const angerIntensityFactor = Math.min(50, totalAnger * 10); // Up to 50 from intensity
-		const targetRage = angryObstacleFactor + angerIntensityFactor;
-
 		// Update score based on distance
 		setGameState((prev) => {
 			// During death sequence, just advance the fade — no score/rage updates
@@ -2258,7 +2654,7 @@ export function TunnelGame() {
 				const deathElapsed = (Date.now() - prev.deathStartTime) / 1000;
 				const DEATH_DURATION = 8;
 				if (deathElapsed >= DEATH_DURATION) {
-					return { ...prev, isGameOver: true };
+					return { ...prev, isGameOver: true, deathSequence: false };
 				}
 				return prev;
 			}
@@ -2266,33 +2662,26 @@ export function TunnelGame() {
 			const newScore = prev.score + Math.floor(speed * deltaTime * 10);
 			const newLevel = Math.floor(newScore / 1000) + 1;
 
-			// Smooth rage level transitions
-			let newRageLevel = prev.rageLevel;
-			if (targetRage > prev.rageLevel) {
-				newRageLevel = Math.min(100, prev.rageLevel + 40 * deltaTime);
-				newRageLevel = Math.min(newRageLevel, targetRage);
-			} else {
-				newRageLevel = Math.max(0, prev.rageLevel - 10 * deltaTime);
-				newRageLevel = Math.max(newRageLevel, targetRage);
-			}
-
-			// Check for death by old age
+			// Check for death before decay — rage bumps from events can push to 100
 			const currentTimeSurvived = (Date.now() - prev.timeStarted) / 1000;
 			const yearsLived = Math.floor(currentTimeSurvived / 60);
 			const currentPlayerAge = (prev.playerAge || 0) + yearsLived;
 
-			// Trigger death sequence: rage maxed out OR old age
-			if ((newRageLevel >= 100 || currentPlayerAge >= prev.maxAge) && !prev.deathSequence) {
+			if ((prev.rageLevel >= 100 || currentPlayerAge >= prev.maxAge) && !prev.deathSequence && !pilotSettings.ignoreDeath) {
 				saveHighScore();
 				return {
 					...prev,
 					score: newScore,
 					level: newLevel,
-					rageLevel: newRageLevel,
+					rageLevel: prev.rageLevel,
 					deathSequence: true,
 					deathStartTime: Date.now(),
 				};
 			}
+
+			// Rage decays slowly on its own — events bump it up
+			const rageDecay = 0.87 * deltaTime; // loses ~0.87% per second
+			const newRageLevel = Math.min(100, Math.max(0, prev.rageLevel - rageDecay));
 
 			return {
 				...prev,
@@ -2338,27 +2727,31 @@ export function TunnelGame() {
 		// Clear behavior system
 		behaviorSystemRef.current.clear();
 
-		// Clear obstacles and projectiles
-		obstaclesRef.current.forEach((obs) => sceneRef.current?.remove(obs.mesh));
+		// Clear obstacles and projectiles — dispose GPU resources
+		obstaclesRef.current.forEach((obs) => { disposeMesh(obs.mesh); sceneRef.current?.remove(obs.mesh); });
 		obstaclesRef.current = [];
 		projectilesRef.current.forEach((proj) => {
+			disposeMesh(proj.mesh);
 			sceneRef.current?.remove(proj.mesh);
 			sceneRef.current?.remove(proj.light);
 		});
 		projectilesRef.current = [];
-		motesRef.current.forEach((mote) => sceneRef.current?.remove(mote.mesh));
+		motesRef.current.forEach((mote) => { disposeMesh(mote.mesh); sceneRef.current?.remove(mote.mesh); });
 		motesRef.current = [];
 		corkscrewGroupsRef.current.forEach((group) => {
 			group.obstacles.forEach((obs) => {
 					const beh = (obs.mesh as unknown as { _behavior?: BehaviorState })?._behavior;
 					if (beh) behaviorSystemRef.current.unregister(beh);
+					disposeMesh(obs.mesh);
 					sceneRef.current?.remove(obs.mesh);
 				});
 		});
 		corkscrewGroupsRef.current = [];
-		rollingSpheresRef.current.forEach((sphere) => sceneRef.current?.remove(sphere.mesh));
+		rollingSpheresRef.current.forEach((sphere) => { disposeMesh(sphere.mesh); sceneRef.current?.remove(sphere.mesh); });
 		rollingSpheresRef.current = [];
 		quarkPairsRef.current.forEach((pair) => {
+			disposeMesh(pair.meshA);
+			disposeMesh(pair.meshB);
 			sceneRef.current?.remove(pair.meshA);
 			sceneRef.current?.remove(pair.meshB);
 			if (pair.behaviorA) behaviorSystemRef.current.unregister(pair.behaviorA);
@@ -2366,10 +2759,20 @@ export function TunnelGame() {
 		});
 		quarkPairsRef.current = [];
 		shatterFragmentsRef.current.forEach((frag) => {
+			disposeMesh(frag.meshA);
+			disposeMesh(frag.meshB);
 			sceneRef.current?.remove(frag.meshA);
 			sceneRef.current?.remove(frag.meshB);
 		});
 		shatterFragmentsRef.current = [];
+		fogBanksRef.current.forEach((bank) => {
+			for (const disc of bank.discs) {
+				sceneRef.current?.remove(disc);
+				(disc.material as THREE.Material).dispose();
+			}
+		});
+		fogBanksRef.current = [];
+		fogSpawnTimerRef.current = 0; // spawn opening fog on restart
 
 		// Clear all key states to prevent stuck movement
 		keysRef.current = {};
@@ -2387,13 +2790,14 @@ export function TunnelGame() {
 			maxAge: 80 + Math.floor(Math.random() * 41),
 			showAgeInput: true,
 			rageLevel: 0,
+			collisionCount: 0,
 			deathSequence: false,
 			deathStartTime: 0,
 		});
 		setAgeInput("");
 
-		// Reset story modal
-		setShowStoryModal(true);
+		// Reset story modal (skip if setting is on)
+		setShowStoryModal(!usePilotStore.getState().settings.skipIntro);
 		setStoryStarted(false);
 		setStoryText("");
 		setShowContinueButton(false);
@@ -2414,8 +2818,13 @@ export function TunnelGame() {
 		? Math.floor((Date.now() - gameState.timeStarted) / 1000)
 		: Math.floor((Date.now() - gameState.timeStarted) / 1000);
 
-	// Calculate duration in years (1 minute = 1 year, so 60 seconds = 1 year)
+	// Calculate duration (1 minute = 1 year, so 60 seconds = 1 year)
 	const durationInYears = Math.floor(timeSurvived / 60);
+	const durationMonths = Math.floor((timeSurvived % 60) / 5); // 5 sec = 1 month
+	const durationDays = Math.floor(((timeSurvived % 60) % 5) / 5 * 30); // remaining as days
+	const durationStr = durationInYears > 0
+		? `${durationInYears}Y.${String(durationMonths).padStart(2, "0")}M.${String(durationDays).padStart(2, "0")}D`
+		: `${durationMonths}M.${String(durationDays).padStart(2, "0")}D`;
 
 	// Calculate current age
 	const currentAge = gameState.playerAge !== null ? gameState.playerAge + durationInYears : 0;
@@ -2446,43 +2855,67 @@ export function TunnelGame() {
 				<div className="absolute inset-0 pointer-events-none">
 					{/* Top Status Bar */}
 					<div className="absolute top-0 left-0 right-0 h-12 bg-gradient-to-b from-cyan-950/90 to-cyan-950/40 backdrop-blur-sm border-b border-cyan-500/30">
-						<div className="flex items-center justify-between h-full px-6">
-							<div className="flex items-center gap-4 font-mono text-xs tracking-wider">
+						<div className="flex items-center justify-between h-full px-4">
+							{/* Left — settings & status */}
+							<div className="flex items-center gap-3 font-mono text-xs tracking-wider">
 								<PilotSettings currentAge={currentAge} />
-								<div className="flex items-center gap-2">
-									<div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
-									<span className="text-green-400">SYS.ONLINE</span>
+								<div className="flex items-center gap-1.5">
+									<div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+									<span className="text-green-400/70 text-[9px] tracking-widest">SYS.OK</span>
 								</div>
-								<div className="text-cyan-300">MISSION.TIME: {durationInYears}Y</div>
-								<div className="text-cyan-300">{displaySpeed.toFixed(1)} km/s</div>
 							</div>
-							<div className="flex items-center gap-4">
-								{/* Rage Meter - Heat Map */}
-								<div className="flex items-center gap-3">
-									<div className="font-mono text-xs text-cyan-400 tracking-widest">RAGE.LEVEL</div>
-									<div className="flex items-center gap-0.5 h-5 bg-slate-900/50 px-1 rounded border border-cyan-500/20">
-										{[...Array(20)].map((_, i) => {
-											const threshold = (i / 20) * 100;
-											const isActive = gameState.rageLevel > threshold;
-											const barColor = getRageColor(threshold + 2.5);
-											return (
-												<div
-													key={i}
-													className="w-1.5 h-full transition-all duration-200 rounded-sm"
-													style={{
-														backgroundColor: isActive ? barColor : 'rgba(71, 85, 105, 0.3)',
-														opacity: isActive ? 1 : 0.4,
-													}}
-												/>
-											);
-										})}
-									</div>
-									<div className="font-mono text-xs tracking-wider" style={{ color: getRageColor(gameState.rageLevel) }}>
-										{Math.round(gameState.rageLevel)}%
+
+							{/* Center — Duration, Speed, Rage readouts */}
+							<div className="flex items-center gap-5">
+								{/* Duration readout */}
+								<div className="flex flex-col items-center">
+									<div className="font-mono text-[8px] tracking-[0.2em] text-cyan-500/40">MISSION.DURATION</div>
+									<div className="font-mono text-sm tracking-widest text-cyan-300 tabular-nums">{durationStr}</div>
+								</div>
+
+								<div className="w-px h-7 bg-cyan-500/20" />
+
+								{/* Speed readout */}
+								<div className="flex flex-col items-center">
+									<div className="font-mono text-[8px] tracking-[0.2em] text-cyan-500/40">VELOCITY</div>
+									<div className="font-mono text-sm tracking-widest text-cyan-300" style={{ fontVariantNumeric: 'tabular-nums' }}><span style={{ display: 'inline-block', width: '3.5ch', textAlign: 'right' }}>{displaySpeed.toFixed(1)}</span><span className="text-[9px] text-cyan-500/50 ml-0.5">km/s</span></div>
+								</div>
+
+								<div className="w-px h-7 bg-cyan-500/20" />
+
+								{/* Entity Rage meter */}
+								<div className="flex flex-col items-center">
+									<div className="font-mono text-[8px] tracking-[0.2em] text-cyan-500/40">ENTITY.RAGE</div>
+									<div className="flex items-center gap-1.5">
+										<div className="flex items-center gap-px h-4 bg-black/60 px-0.5 rounded-sm border border-cyan-500/20">
+											{[...Array(20)].map((_, i) => {
+												const threshold = (i / 20) * 100;
+												const isActive = gameState.rageLevel > threshold;
+												return (
+													<div
+														key={i}
+														className="w-1 h-3 transition-all duration-200"
+														style={{
+															backgroundColor: isActive
+																? `rgba(239, 68, 68, ${0.5 + (i / 20) * 0.5})`
+																: 'rgba(239, 68, 68, 0.08)',
+														}}
+													/>
+												);
+											})}
+										</div>
+										<div className="font-mono text-[10px] tracking-wider text-cyan-400/70 tabular-nums" style={{ fontVariantNumeric: 'tabular-nums' }}>
+											<span className="text-cyan-400/70 w-7 inline-block text-right">{Math.round(gameState.rageLevel)}%</span>
+											<span className="text-cyan-500/40 ml-1">{gameState.collisionCount}x</span>
+										</div>
 									</div>
 								</div>
-								<div className="font-mono text-xs text-cyan-400 tracking-widest">
-									RAMA.31/39.RENDEZVOUS
+							</div>
+
+							{/* Right — title & playlist */}
+							<div className="flex items-center gap-3">
+								<div className="font-mono text-[9px] text-cyan-500/30 tracking-[0.2em]">
+									RAMA.31/39
 								</div>
 								<PlaylistSettings currentTrackId={currentTrackId} onPlayTrack={(id) => playlistManagerRef.current?.playTrackById(id)} />
 							</div>
@@ -2496,11 +2929,145 @@ export function TunnelGame() {
 				</div>
 			)}
 
-			{/* Controls Info */}
+			{/* Retro Radio — 1980s car stereo style, slideable */}
 			{!gameState.isGameOver && !gameState.deathSequence && !gameState.showAgeInput && (
-				<div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-gradient-to-r from-slate-950/95 to-slate-900/95 backdrop-blur-md px-6 py-3 border border-cyan-500/30 pointer-events-none shadow-lg shadow-cyan-500/10">
-					<div className="text-cyan-300 font-mono text-[10px] text-center tracking-widest">
-						◄►▲▼: NAVIGATE | [SPACE]: DEPLOY.FLARE
+				<div className="absolute bottom-0 left-1/2 -translate-x-1/2 pointer-events-auto flex flex-col items-center transition-transform duration-300 ease-in-out" style={{ transform: `translate(-50%, ${radioOpen ? '0px' : '60px'})` }}>
+					{/* Toggle tab */}
+					<button
+						onClick={() => setRadioOpen(!radioOpen)}
+						className="mb-[-1px] px-4 py-[2px] bg-gradient-to-b from-zinc-700 to-zinc-800 border border-zinc-600/50 border-b-0 rounded-t-sm font-mono text-[7px] tracking-[0.3em] text-cyan-500/40 hover:text-cyan-400/60 transition-colors"
+					>
+						{radioOpen ? '▼ RADIO' : '▲ RADIO'}
+					</button>
+					<div className="relative bg-gradient-to-b from-zinc-800 to-zinc-950 border border-zinc-600/60 rounded-sm shadow-xl shadow-black/60 mb-4" style={{ width: 320, padding: '6px 8px 8px' }}>
+						{/* Chrome trim top */}
+						<div className="absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-cyan-300/30 to-transparent" />
+						{/* Display window */}
+						<div className="bg-black/80 border border-zinc-700/50 rounded-sm px-3 py-1.5 mb-1.5" style={{ boxShadow: 'inset 0 1px 4px rgba(0,0,0,0.8)' }}>
+							<div className="flex items-center justify-between">
+								<div className="font-mono text-[8px] tracking-[0.2em] text-cyan-600/50">259.7 MHz</div>
+								<div className="font-mono text-[9px] tracking-wider text-cyan-400/70 truncate max-w-[180px]">
+									{currentTrackId
+										? playlistTracks.find(t => t.id === currentTrackId)?.name?.toUpperCase() ?? '---'
+										: activePlaylist?.name?.toUpperCase() ?? '---'}
+								</div>
+								{/* 3-band level meter */}
+								<div className="flex items-end gap-[2px] h-[14px]">
+									{[bassEnergyRef.current, midEnergyRef.current, trebleEnergyRef.current].map((energy, bandIdx) => {
+										const bars = 5;
+										const level = Math.round(energy * bars);
+										return (
+											<div key={bandIdx} className="flex flex-col-reverse gap-[1px]">
+												{[...Array(bars)].map((_, barIdx) => (
+													<div
+														key={barIdx}
+														className="rounded-[0.5px] transition-opacity duration-75"
+														style={{
+															width: 3,
+															height: 2,
+															backgroundColor: barIdx >= bars - 1 ? 'rgba(239,68,68,0.8)' : barIdx >= bars - 2 ? 'rgba(250,204,21,0.7)' : 'rgba(34,211,238,0.6)',
+															opacity: barIdx < level ? 1 : 0.1,
+														}}
+													/>
+												))}
+											</div>
+										);
+									})}
+								</div>
+							</div>
+							{/* Tuner bar */}
+							<div className="mt-1 h-[1px] bg-cyan-900/30 relative">
+								<div
+									className="absolute top-[-1px] h-[3px] w-[3px] rounded-full bg-cyan-400/80"
+									style={{
+										left: `${Math.max(5, Math.min(95, ((playlistActiveIndex + 1) / Math.max(1, playlistPlaylists.length)) * 100))}%`,
+										boxShadow: '0 0 4px rgba(34,211,238,0.4)',
+									}}
+								/>
+								{/* Frequency marks */}
+								{[...Array(12)].map((_, i) => (
+									<div key={i} className="absolute top-0 h-[1px] w-[1px] bg-cyan-700/30" style={{ left: `${(i + 1) * 8}%` }} />
+								))}
+							</div>
+						</div>
+						{/* Preset buttons row */}
+						<div className="flex items-center gap-1">
+							{/* Mute knob */}
+							<button
+								onClick={() => setMusicMuted(!musicMuted)}
+								className="group flex-shrink-0 w-6 h-6 rounded-full border border-zinc-600/50 bg-gradient-to-b from-zinc-700 to-zinc-900 flex items-center justify-center hover:border-cyan-500/40 active:bg-zinc-800 transition-colors cursor-pointer"
+								style={{ boxShadow: 'inset 0 1px 2px rgba(255,255,255,0.05), 0 1px 3px rgba(0,0,0,0.5)' }}
+								title={musicMuted ? "Unmute music" : "Mute music"}
+							>
+								{musicMuted ? (
+									<svg className="w-3 h-3 text-red-400/70" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+										<path d="M8 3L4 6H2v4h2l4 3V3z" fill="currentColor" />
+										<line x1="12" y1="5" x2="12" y2="11" strokeLinecap="round" />
+										<line x1="10" y1="7" x2="14" y2="7" strokeLinecap="round" className="rotate-45 origin-center" style={{ transformOrigin: '12px 8px', transform: 'rotate(45deg)' }} />
+										<line x1="10" y1="9" x2="14" y2="9" strokeLinecap="round" style={{ transformOrigin: '12px 8px', transform: 'rotate(-45deg)' }} />
+									</svg>
+								) : (
+									<>
+										<div className="w-[1px] h-2 bg-cyan-500/40 -translate-y-[1px] group-hover:hidden" />
+										<svg className="w-3 h-3 text-cyan-400/70 hidden group-hover:block" viewBox="0 0 16 16" fill="currentColor">
+											<path d="M8 3L4 6H2v4h2l4 3V3z" />
+											<path d="M11 5.5c.8.8.8 2.2 0 3M12.5 4c1.5 1.5 1.5 4 0 5.5" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+										</svg>
+									</>
+								)}
+							</button>
+							{/* 9 preset buttons — each maps to a playlist */}
+							<div className="flex-1 flex gap-[3px]">
+								{[...Array(9)].map((_, i) => {
+									const playlist = playlistPlaylists[i];
+									const isActive = i === playlistActiveIndex;
+									return (
+										<button
+											key={i}
+											onClick={() => {
+												if (playlist) {
+													setActivePlaylist(i);
+													// Start playing from the new playlist
+													if (playlistManagerRef.current) {
+														const tracks = playlist.trackIds
+															.map((id) => playlistTracks.find((t) => t.id === id))
+															.filter((t): t is NonNullable<typeof t> => t != null && !!t.src && !t.unavailable);
+														playlistManagerRef.current.updatePlaylist(tracks, playlistVolume, playlist.shuffle);
+														playlistManagerRef.current.play();
+													}
+												}
+											}}
+											disabled={!playlist}
+											className={`flex-1 h-6 rounded-[2px] font-mono text-[9px] font-bold transition-all duration-150 ${
+												isActive
+													? 'bg-cyan-900/60 text-cyan-300 border border-cyan-500/40 shadow-inner'
+													: playlist
+														? 'bg-zinc-800 text-cyan-500/50 border border-zinc-700/40 hover:bg-zinc-700/80 hover:text-cyan-400/70 active:bg-cyan-900/40'
+														: 'bg-zinc-900/50 text-zinc-700/30 border border-zinc-800/30 cursor-default'
+											}`}
+											style={{ boxShadow: isActive ? 'inset 0 1px 4px rgba(0,0,0,0.6), 0 0 3px rgba(34,211,238,0.1)' : '0 1px 2px rgba(0,0,0,0.4)' }}
+										>
+											{i + 1}
+										</button>
+									);
+								})}
+							</div>
+							{/* Skip knob */}
+							<button
+								onClick={() => playlistManagerRef.current?.next()}
+								className="group flex-shrink-0 w-6 h-6 rounded-full border border-zinc-600/50 bg-gradient-to-b from-zinc-700 to-zinc-900 flex items-center justify-center hover:border-cyan-500/40 active:bg-zinc-800 transition-colors cursor-pointer"
+								style={{ boxShadow: 'inset 0 1px 2px rgba(255,255,255,0.05), 0 1px 3px rgba(0,0,0,0.5)' }}
+								title="Next track"
+							>
+								<div className="w-[1px] h-2 bg-cyan-500/40 rotate-45 -translate-y-[1px] group-hover:hidden" />
+								<svg className="w-3 h-3 text-cyan-400/70 hidden group-hover:block" viewBox="0 0 12 12" fill="currentColor">
+									<polygon points="1,1 8,6 1,11" />
+									<rect x="9" y="1" width="2" height="10" />
+								</svg>
+							</button>
+						</div>
+						{/* Chrome trim bottom */}
+						<div className="absolute bottom-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-zinc-500/20 to-transparent" />
 					</div>
 				</div>
 			)}
@@ -2588,7 +3155,7 @@ export function TunnelGame() {
 
 			{/* Game Over Screen — only after death sequence completes */}
 			{gameState.isGameOver && !gameState.deathSequence && (
-				<div className="absolute inset-0 flex items-center justify-center bg-black/70">
+				<div className="absolute inset-0 flex items-center justify-center bg-black/85">
 					<Card className="w-full max-w-md p-8 bg-gradient-to-b from-zinc-950/95 to-black/95 border-cyan-500/10">
 						<div className="text-center space-y-6">
 							<h1 className="text-lg font-mono text-cyan-300/50 tracking-[0.3em]">
@@ -2604,42 +3171,11 @@ export function TunnelGame() {
 								You were never heard from again.
 							</p>
 
-							<div className="flex gap-3 justify-center pt-4">
+							<div className="flex justify-center pt-4">
 								<Button onClick={restartGame} size="lg" className="font-mono bg-cyan-900/50 hover:bg-cyan-800/70 text-cyan-200/70 border-cyan-500/20">
 									New Pilot
 								</Button>
-								<Button
-									onClick={() => setShowHighScores(!showHighScores)}
-									size="lg"
-									variant="outline"
-									className="font-mono border-cyan-500/20 text-cyan-400/50 hover:bg-cyan-950/50 hover:text-cyan-300/70"
-								>
-									{showHighScores ? "Hide" : "Show"} Records
-								</Button>
 							</div>
-
-							{showHighScores && (
-								<div className="mt-6 bg-cyan-950/30 rounded-lg p-4 border border-cyan-500/20">
-									<h2 className="text-sm text-cyan-300/50 mb-3 font-mono tracking-wider">MISSION.RECORDS</h2>
-									<div className="space-y-2 max-h-64 overflow-y-auto">
-										{highScores.length === 0 ? (
-											<div className="text-cyan-400/40 text-sm font-mono">NO.RECORDS.FOUND</div>
-										) : (
-											highScores.map((score, index) => (
-												<div
-													key={index}
-													className="flex justify-between items-center text-cyan-300/60 font-mono text-sm bg-cyan-950/50 px-3 py-2 rounded border border-cyan-500/10"
-												>
-													<span className="font-bold text-cyan-400/50">#{index + 1}</span>
-													<span>{score.player_name}</span>
-													<span>{score.score} pts</span>
-													<span className="text-cyan-400/40">Lvl {score.level_reached}</span>
-												</div>
-											))
-										)}
-									</div>
-								</div>
-							)}
 						</div>
 					</Card>
 				</div>

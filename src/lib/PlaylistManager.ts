@@ -88,10 +88,9 @@ export class PlaylistManager {
 		return count > 0 ? sum / (count * 255) : 0;
 	}
 
+	/** Update with resolved tracks for the active playlist. */
 	updatePlaylist(tracks: PlaylistTrack[], volume: number, shuffle: boolean): void {
-		const newEnabled = tracks
-			.filter((t) => t.enabled)
-			.sort((a, b) => a.order - b.order);
+		const newEnabled = tracks.filter((t) => t.src && !t.unavailable);
 
 		const enabledChanged =
 			newEnabled.length !== this.enabledTracks.length ||
@@ -106,7 +105,7 @@ export class PlaylistManager {
 			this.rebuildShuffleOrder();
 		}
 
-		// If current track was removed/disabled, advance
+		// If current track was removed, advance
 		if (this.currentIndex >= 0) {
 			const currentId = this.getCurrentTrackId();
 			if (currentId && !newEnabled.find((t) => t.id === currentId)) {
@@ -162,6 +161,10 @@ export class PlaylistManager {
 
 	pause(): void {
 		this.audio.pause();
+	}
+
+	setMuted(muted: boolean): void {
+		this.audio.muted = muted;
 	}
 
 	stop(): void {

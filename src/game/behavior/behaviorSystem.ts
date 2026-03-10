@@ -288,13 +288,22 @@ export class BehaviorSystem {
 			mood.fear = Math.max(0, mood.fear - dt * 0.2); // ~5s to calm
 		}
 
-		// Excitement: rises from nearby angry/excited neighbors
+		// Excitement: rises from nearby angry/excited neighbors, falling off with distance
+		const neighborRadius = NEIGHBOR_RADIUS[entity.kind];
 		let neighborExcitement = 0;
+		let weightSum = 0;
 		for (let i = 0; i < neighbors.length; i++) {
-			neighborExcitement += neighbors[i].mood.anger + neighbors[i].mood.excitement;
+			const n = neighbors[i];
+			const dx = entity.position.x - n.position.x;
+			const dy = entity.position.y - n.position.y;
+			const dz = entity.position.z - n.position.z;
+			const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+			const weight = Math.max(0, 1 - dist / neighborRadius); // 1.0 at origin, 0 at edge
+			neighborExcitement += (n.mood.anger + n.mood.excitement) * weight;
+			weightSum += weight;
 		}
-		if (neighbors.length > 0) {
-			neighborExcitement /= neighbors.length;
+		if (weightSum > 0) {
+			neighborExcitement /= weightSum;
 		}
 		mood.excitement = Math.min(1, mood.excitement + neighborExcitement * dt * 0.3);
 		mood.excitement = Math.max(0, mood.excitement - dt * 0.15);

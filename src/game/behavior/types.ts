@@ -41,6 +41,7 @@ export interface BehaviorContext {
 	currentTime: number;
 	activeFlarePositions: THREE.Vector3[];
 	quarkShardPositions: THREE.Vector3[];
+	trebleEnergy: number; // 0-1, high-frequency audio energy for flourish effects
 	globalMood: {
 		avgAnger: number;
 		avgFear: number;

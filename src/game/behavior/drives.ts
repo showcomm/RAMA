@@ -169,14 +169,14 @@ export function territoryDrive(entity: BehaviorState, neighbors: BehaviorState[]
 	return steer;
 }
 
-/** Steer away from quark shard positions. Non-quark entities give them wide berth. */
+/** Steer away from quark shard positions. Non-quark entities give them wide berth.
+ *  Motes get a tangential swirl force instead — they orbit the quarks. */
 export function quarkAvoidanceDrive(entity: BehaviorState, ctx: BehaviorContext): THREE.Vector3 {
 	const steer = scratch();
-	// Quark shards themselves and motes don't avoid
-	if (entity.kind === "quarkShard" || entity.kind === "mote") return steer;
+	if (entity.kind === "quarkShard") return steer;
 	if (ctx.quarkShardPositions.length === 0) return steer;
 
-	const avoidRadius = 4.0; // entities steer away within 4 units
+	const avoidRadius = entity.kind === "mote" ? 5.0 : 10.0; // motes swirl zone, others flee wide
 	const avoidRadiusSq = avoidRadius * avoidRadius;
 
 	for (let i = 0; i < ctx.quarkShardPositions.length; i++) {
@@ -187,10 +187,26 @@ export function quarkAvoidanceDrive(entity: BehaviorState, ctx: BehaviorContext)
 		const distSq = dx * dx + dy * dy + dz * dz;
 		if (distSq < avoidRadiusSq && distSq > 0.01) {
 			const dist = Math.sqrt(distSq);
-			const urgency = 1 - dist / avoidRadius; // stronger when closer
-			steer.x += (dx / dist) * urgency;
-			steer.y += (dy / dist) * urgency;
-			steer.z += (dz / dist) * urgency;
+			const urgency = 1 - dist / avoidRadius;
+
+			if (entity.kind === "mote") {
+				// Tangential swirl — motes orbit around the quark pair
+				// Base swirl always present, treble energy amplifies it (flourishes)
+				const flourish = 0.4 + ctx.trebleEnergy * 1.2; // base 0.4, up to 1.6 on treble
+				const swirlStrength = urgency * urgency * flourish;
+				// Cross product of (dx,dy,0) with (0,0,1) = (dy, -dx, 0)
+				steer.x += dy / dist * swirlStrength;
+				steer.y += -dx / dist * swirlStrength;
+				// Gentle inward pull to keep them in orbit
+				const pullStrength = urgency * 0.3;
+				steer.x -= dx / dist * pullStrength;
+				steer.y -= dy / dist * pullStrength;
+			} else {
+				// Other entities: strong repulsion
+				steer.x += (dx / dist) * urgency * 1.5;
+				steer.y += (dy / dist) * urgency * 1.5;
+				steer.z += (dz / dist) * urgency;
+			}
 		}
 	}
 	return steer;
@@ -200,19 +216,30 @@ export function quarkAvoidanceDrive(entity: BehaviorState, ctx: BehaviorContext)
 let _murmNextTrigger = 0;
 let _murmActive = false;
 let _murmStartTime = 0;
+let _murmJustTriggered = false; // true for one frame when a new murmuration starts
+
+/** Returns true once when a new murmuration event starts, then resets. */
+export function didMurmurationJustTrigger(): boolean {
+	if (_murmJustTriggered) {
+		_murmJustTriggered = false;
+		return true;
+	}
+	return false;
+}
 // Per-mote data for recruited motes
 interface MurmData {
 	startX: number;       // position when recruited
 	startY: number;
-	swirlAngle: number;   // unique orbit phase per mote
-	orbitRadius: number;   // unique orbit radius per mote (loose cloud)
+	cloudAngle: number;   // mote's fixed angle within the cloud shape
+	cloudRadius: number;  // mote's fixed distance from cloud center (compact)
 	zBoost: number;
 }
 const _murmData = new WeakMap<BehaviorState, MurmData>();
-// Sine wave params for the vortex center path
-let _murmSineAngle = 0;   // direction the sine wave oscillates across
-let _murmSineAmp = 0;
-let _murmSineFreq = 0;
+
+// Helix path parameters for the flock center
+let _helixRadius = 0;     // how far from tunnel center the helix orbits
+let _helixSpeed = 0;       // angular speed of the helix (rad/s)
+let _helixPhase = 0;       // starting angle
 
 const FIRST_EVENT_DELAY = 60000; // 60s before first murmuration
 const MIN_IDLE = 15000;
@@ -221,10 +248,9 @@ const MAX_IDLE = 30000;
 // Per-event parameters — randomized at trigger time
 let _evGatherDuration = 2000;
 let _evFlyDuration = 5000;
-let _evZBoost = 8;
-let _evOrbitSpeed = 2.5;
-let _evCloudMin = 0.3;
-let _evCloudMax = 1.2;
+let _evZBoostBase = 6;      // initial z speed
+let _evZBoostFlock = 14;    // faster once flocked
+let _evCloudRadius = 0.8;   // how compact the cloud is
 
 /**
  * Get the extra z-speed for a mote in murmuration. Returns 0 if not recruited.
@@ -243,10 +269,11 @@ export function isMurmurationActive(entity: BehaviorState): boolean {
 }
 
 /**
- * Murmuration: periodically, motes 7-13 panels ahead form a loose
- * swirling cloud that corkscrews toward the ship in a sine-wave path,
- * then flies past and off screen. Directly sets entity position —
- * bypasses normal steering entirely for recruited motes.
+ * Murmuration: periodically, motes ahead form a compact cloud that
+ * spirals through the tunnel on a helix path (like a loose corkscrew).
+ * All motes move in unison — same rotational velocity, same center —
+ * just distributed at fixed positions within the cloud shape.
+ * The flock compacts and accelerates once gathered.
  */
 export function updateMurmuration(ctx: BehaviorContext, entities: readonly BehaviorState[]): void {
 	const now = ctx.currentTime;
@@ -260,31 +287,41 @@ export function updateMurmuration(ctx: BehaviorContext, entities: readonly Behav
 	if (!_murmActive && now >= _murmNextTrigger) {
 		_murmActive = true;
 		_murmStartTime = now;
-		_murmSineAngle = Math.random() * Math.PI * 2;
-		_murmSineAmp = 1.5 + Math.random() * 3.5;        // 1.5-5.0 (how wide the sine sweeps)
-		_murmSineFreq = 0.6 + Math.random() * 1.4;        // 0.6-2.0 (how many oscillations)
+		_murmJustTriggered = true;
+
+		// Helix path: flock center spirals through the tunnel
+		_helixRadius = 1.5 + Math.random() * 2.5;  // 1.5-4.0 from tunnel center
+		_helixSpeed = 1.2 + Math.random() * 1.8;    // 1.2-3.0 rad/s (loose spiral)
+		_helixPhase = Math.random() * Math.PI * 2;
 
 		// Randomize per-event shape
-		_evGatherDuration = 1500 + Math.random() * 1500;   // 1.5-3s gather
-		_evFlyDuration = 3000 + Math.random() * 5000;      // 3-8s fly
-		_evZBoost = 5 + Math.random() * 6;                 // 5-11 speed
-		_evOrbitSpeed = 1.5 + Math.random() * 3.0;         // 1.5-4.5 rad/s swirl
-		_evCloudMin = 0.15 + Math.random() * 0.3;          // 0.15-0.45 tight core
-		_evCloudMax = 0.6 + Math.random() * 1.2;           // 0.6-1.8 outer edge
+		_evGatherDuration = 1500 + Math.random() * 1000;  // 1.5-2.5s gather
+		_evFlyDuration = 4000 + Math.random() * 4000;     // 4-8s flight
+		_evZBoostBase = 4 + Math.random() * 4;            // 4-8 initial speed
+		_evZBoostFlock = 10 + Math.random() * 8;          // 10-18 once flocked
+		_evCloudRadius = 0.4 + Math.random() * 0.6;       // 0.4-1.0 cloud compactness
 
 		// Recruit motes in the z-range
+		// Distribute them evenly throughout the cloud shape
+		let recruitIndex = 0;
 		for (let i = 0; i < entities.length; i++) {
 			const e = entities[i];
 			if (e.kind !== "mote") continue;
 			const z = e.position.z;
 			if (z < -35 && z > -65) {
+				// Golden angle distribution for even cloud fill
+				const golden = 2.399963; // golden angle in radians
+				const angle = recruitIndex * golden;
+				// Sqrt distribution for even area coverage
+				const r = _evCloudRadius * Math.sqrt((recruitIndex + 1) / 30); // normalize assuming ~30 motes
 				_murmData.set(e, {
 					startX: e.position.x,
 					startY: e.position.y,
-					swirlAngle: Math.random() * Math.PI * 2,
-					orbitRadius: _evCloudMin + Math.random() * (_evCloudMax - _evCloudMin),
+					cloudAngle: angle,
+					cloudRadius: Math.min(r, _evCloudRadius),
 					zBoost: 0,
 				});
+				recruitIndex++;
 			}
 		}
 	}
@@ -298,20 +335,28 @@ export function updateMurmuration(ctx: BehaviorContext, entities: readonly Behav
 	if (elapsed > totalDuration) {
 		_murmActive = false;
 		_murmNextTrigger = now + MIN_IDLE + Math.random() * (MAX_IDLE - MIN_IDLE);
-		// Clean up all recruited motes
 		for (let i = 0; i < entities.length; i++) {
 			_murmData.delete(entities[i]);
 		}
 		return;
 	}
 
-	// --- Compute vortex center (sine wave across tunnel cross-section) ---
-	const flyProgress = Math.max(0, (elapsed - _evGatherDuration) / _evFlyDuration);
-	const sineValue = Math.sin(flyProgress * _murmSineFreq * Math.PI * 2) * _murmSineAmp;
-	const vortexCX = Math.cos(_murmSineAngle) * sineValue;
-	const vortexCY = Math.sin(_murmSineAngle) * sineValue;
-
 	const elapsedSec = elapsed / 1000;
+
+	// --- Compute flock center on helix path ---
+	// The whole flock center spirals through the tunnel like a loose corkscrew
+	const helixAngle = _helixPhase + _helixSpeed * elapsedSec;
+	const flockCX = Math.cos(helixAngle) * _helixRadius;
+	const flockCY = Math.sin(helixAngle) * _helixRadius;
+
+	// Cloud rotation: the entire cloud shape rotates as a unit (slower than helix)
+	const cloudRotation = elapsedSec * 1.5; // shared rotation for all motes
+
+	// Cloud compaction: starts loose, compresses once flocked
+	const flyProgress = Math.max(0, (elapsed - _evGatherDuration) / _evFlyDuration);
+	const compaction = elapsed < _evGatherDuration
+		? 1.0  // normal during gather
+		: 1.0 - flyProgress * 0.4; // compress to 60% radius during flight
 
 	// --- Update each recruited mote ---
 	for (let i = 0; i < entities.length; i++) {
@@ -319,34 +364,30 @@ export function updateMurmuration(ctx: BehaviorContext, entities: readonly Behav
 		const data = _murmData.get(e);
 		if (!data) continue;
 
+		// Each mote has a fixed position in the cloud, rotated by the shared cloudRotation
+		const rotatedAngle = data.cloudAngle + cloudRotation;
+		const r = data.cloudRadius * compaction;
+		const moteTargetX = flockCX + Math.cos(rotatedAngle) * r;
+		const moteTargetY = flockCY + Math.sin(rotatedAngle) * r;
+
 		if (elapsed < _evGatherDuration) {
-			// GATHER: lerp from start position toward vortex orbit position
+			// GATHER: lerp from start position toward cloud position
 			const t = elapsed / _evGatherDuration;
-			// Ease-in-out
-			const ease = t * t * (3 - 2 * t);
+			const ease = t * t * (3 - 2 * t); // smoothstep
 
-			// Where this mote will orbit on the cloud
-			const angle = data.swirlAngle + _evOrbitSpeed * elapsedSec;
-			const orbitX = vortexCX + Math.cos(angle) * data.orbitRadius;
-			const orbitY = vortexCY + Math.sin(angle) * data.orbitRadius;
+			e.position.x = data.startX + (moteTargetX - data.startX) * ease;
+			e.position.y = data.startY + (moteTargetY - data.startY) * ease;
 
-			// Blend from start to orbit position
-			e.position.x = data.startX + (orbitX - data.startX) * ease;
-			e.position.y = data.startY + (orbitY - data.startY) * ease;
-
-			// Ramp up z-boost
-			data.zBoost = _evZBoost * ease * 0.5;
+			// Gradually increase speed during gather
+			data.zBoost = _evZBoostBase * ease;
 		} else {
-			// FLY: orbit the vortex center, which is tracing a sine wave
-			const angle = data.swirlAngle + _evOrbitSpeed * elapsedSec;
-			// Vary orbit radius slightly over time for organic feel
-			const r = data.orbitRadius * (0.8 + 0.2 * Math.sin(angle * 0.6));
+			// FLY: all motes move in unison on the helix, accelerating
+			e.position.x = moteTargetX;
+			e.position.y = moteTargetY;
 
-			e.position.x = vortexCX + Math.cos(angle) * r;
-			e.position.y = vortexCY + Math.sin(angle) * r;
-
-			// Full z-boost
-			data.zBoost = _evZBoost;
+			// Accelerate as the flock tightens — figure skater effect
+			const speedRamp = _evZBoostBase + (_evZBoostFlock - _evZBoostBase) * flyProgress;
+			data.zBoost = speedRamp;
 		}
 	}
 }

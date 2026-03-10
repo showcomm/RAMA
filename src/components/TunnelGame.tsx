@@ -97,6 +97,25 @@ interface Mote {
 	behavior: BehaviorState | null; // Behavior system state
 }
 
+// A self-contained flock: firefly leader + ~30 motes with individual physics
+interface FlockMember {
+	mesh: THREE.Mesh;
+	vel: THREE.Vector3;        // individual velocity
+	accelScale: number;        // 0.6-1.4 — how responsive this mote is (variation)
+	preferredDist: number;     // 0.8-2.0 — how far from leader it likes to be
+	phase: number;             // unique phase for subtle motion
+}
+
+interface Flock {
+	leader: THREE.Mesh;
+	members: FlockMember[];
+	leaderPos: THREE.Vector3;
+	leaderVel: THREE.Vector3;
+	spawnTime: number;
+	wanderTarget: THREE.Vector2;
+	wanderTimer: number;
+}
+
 interface CorkscrewObstacle {
 	mesh: THREE.Mesh;
 	groupId: string; // Shared ID for all obstacles in the formation
@@ -212,6 +231,8 @@ export function TunnelGame() {
 	const motesRef = useRef<Mote[]>([]);
 	const corkscrewGroupsRef = useRef<CorkscrewGroup[]>([]);
 	const rollingSpheresRef = useRef<RollingSphere[]>([]);
+	const flockRef = useRef<Flock | null>(null);
+	const lastFlockTime = useRef(0);
 	const keysRef = useRef<{ [key: string]: boolean }>({});
 	const gameStateRef = useRef(gameState);
 	const animationFrameRef = useRef<number | undefined>(undefined);
@@ -655,7 +676,7 @@ export function TunnelGame() {
 			lightCycleRef.current = adjustedCycle;
 			// cycle is 0–1, where 0 = darkest, 1 = brightest
 			let ambientIntensity = 0.04 + adjustedCycle * 0.06;
-			let directionalIntensity = 0.2 + adjustedCycle * 0.2;
+			let directionalIntensity = 0.3 + adjustedCycle * 0.2;
 			let rimIntensity = 0.15 + adjustedCycle * 0.15;
 
 			// Death sequence: dim lights, ship flies into the fog
@@ -691,10 +712,10 @@ export function TunnelGame() {
 					// Accelerate forward (negative z) — use deltaTime (computed before lastTime update)
 					const flySpeed = progress * progress * 30; // accelerating
 					ship.position.z -= flySpeed * deltaTime;
-					// Drift toward tunnel center
+					// Drift toward visual vanishing point (camera is at y=1.5, so aim between)
 					const centerRate = 1 - Math.pow(0.03, deltaTime); // frame-rate independent
-					ship.position.x *= 1 - centerRate;
-					ship.position.y *= 1 - centerRate;
+					ship.position.x += (0 - ship.position.x) * centerRate;
+					ship.position.y += (0.5 - ship.position.y) * centerRate;
 					// Shrink as it recedes
 					const shipScale = Math.max(0, 1 - progress * 1.2);
 					ship.scale.setScalar(shipScale);
@@ -2456,6 +2477,45 @@ export function TunnelGame() {
 				});
 
 				if (hit) {
+					// ── Impact flash: expanding bright burst ──
+					const impactPos = projectile.mesh.position.clone();
+					const flashGeo = new THREE.SphereGeometry(0.15, 8, 6);
+					const flashMat = new THREE.MeshStandardMaterial({
+						color: 0xffffcc,
+						emissive: 0xffaa33,
+						emissiveIntensity: 5,
+						transparent: true,
+						opacity: 1,
+					});
+					const flashMesh = new THREE.Mesh(flashGeo, flashMat);
+					flashMesh.position.copy(impactPos);
+					sceneRef.current?.add(flashMesh);
+
+					// Bright point light at impact
+					const flashLight = new THREE.PointLight(0xffaa33, 70, 25);
+					flashLight.position.copy(impactPos);
+					sceneRef.current?.add(flashLight);
+
+					// Animate: expand + fade over 250ms then remove
+					const flashStart = Date.now();
+					const animateFlash = () => {
+						const age = (Date.now() - flashStart) / 250; // 0→1 over 250ms
+						if (age >= 1) {
+							flashGeo.dispose();
+							flashMat.dispose();
+							sceneRef.current?.remove(flashMesh);
+							sceneRef.current?.remove(flashLight);
+							return;
+						}
+						const scale = 1 + age * 4; // expands 1→5x
+						flashMesh.scale.set(scale, scale, scale);
+						flashMat.opacity = 1 - age;
+						flashMat.emissiveIntensity = 5 * (1 - age);
+						flashLight.intensity = 70 * (1 - age * age); // fades quadratically
+						requestAnimationFrame(animateFlash);
+					};
+					requestAnimationFrame(animateFlash);
+
 					disposeMesh(projectile.mesh);
 					sceneRef.current?.remove(projectile.mesh);
 					sceneRef.current?.remove(projectile.light);
@@ -2572,6 +2632,266 @@ export function TunnelGame() {
 			return true;
 		});
 
+		// ── Flock murmuration system ──
+		// Spawn a flock every 25-45 seconds after 60s
+		const flockTimeSurvived = (Date.now() - state.timeStarted) / 1000;
+		if (
+			flockTimeSurvived >= 60
+			&& !flockRef.current
+			&& Date.now() - lastFlockTime.current > 25000 + Math.random() * 20000
+		) {
+			// Leader: warm yellow, 2x mote size, strong glow
+			const leaderGeom = new THREE.SphereGeometry(0.09, 12, 12);
+			const leaderMat = new THREE.MeshStandardMaterial({
+				color: 0xffe066,
+				emissive: 0xffaa22,
+				emissiveIntensity: 1.5,
+				transparent: true,
+				opacity: 0.9,
+			});
+			const leaderMesh = new THREE.Mesh(leaderGeom, leaderMat);
+			const startAngle = Math.random() * Math.PI * 2;
+			const startR = 1.0 + Math.random() * 2.0;
+			const startPos = new THREE.Vector3(
+				Math.cos(startAngle) * startR,
+				Math.sin(startAngle) * startR,
+				-55
+			);
+			leaderMesh.position.copy(startPos);
+			sceneRef.current?.add(leaderMesh);
+
+			// Spawn ~30 flock motes clustered around the leader
+			const members: FlockMember[] = [];
+			const flockSize = 25 + Math.floor(Math.random() * 10);
+			for (let fi = 0; fi < flockSize; fi++) {
+				const mGeom = new THREE.SphereGeometry(0.04, 8, 8);
+				const mMat = new THREE.MeshStandardMaterial({
+					color: 0xfff8e8,
+					emissive: 0xffeab3,
+					emissiveIntensity: 0.5,
+					transparent: true,
+					opacity: 0.7,
+				});
+				const mMesh = new THREE.Mesh(mGeom, mMat);
+				// Scatter around leader
+				const a = Math.random() * Math.PI * 2;
+				const r = 0.3 + Math.random() * 1.2;
+				const zOff = (Math.random() - 0.5) * 1.5;
+				mMesh.position.set(
+					startPos.x + Math.cos(a) * r,
+					startPos.y + Math.sin(a) * r,
+					startPos.z + zOff
+				);
+				sceneRef.current?.add(mMesh);
+
+				members.push({
+					mesh: mMesh,
+					vel: new THREE.Vector3(0, 0, 0),
+					accelScale: 0.6 + Math.random() * 0.8, // 0.6-1.4
+					preferredDist: 0.8 + Math.random() * 1.2, // 0.8-2.0
+					phase: Math.random() * Math.PI * 2,
+				});
+			}
+
+			const wanderA = Math.random() * Math.PI * 2;
+			const wanderR = 1.0 + Math.random() * 2.5;
+
+			flockRef.current = {
+				leader: leaderMesh,
+				members,
+				leaderPos: startPos.clone(),
+				leaderVel: new THREE.Vector3(0, 0, 0),
+				spawnTime: Date.now(),
+				wanderTarget: new THREE.Vector2(Math.cos(wanderA) * wanderR, Math.sin(wanderA) * wanderR),
+				wanderTimer: 800 + Math.random() * 1200,
+			};
+		}
+
+		// Update flock
+		if (flockRef.current) {
+			const flock = flockRef.current;
+			const lp = flock.leaderPos;
+			const elapsed = Date.now() - flock.spawnTime;
+
+			// ── Leader: sinusoidal Lissajous flight path ──
+			const t = elapsed / 1000; // seconds
+
+			// Layered sine waves at irrational ratios — never repeats
+			// Primary sweep: big cross-tunnel arcs
+			// Secondary: faster wobble layered on top
+			const amp1 = 2.8, amp2 = 1.2;
+			const freq1x = 1.7, freq1y = 1.3;   // primary — slow sweeping
+			const freq2x = 4.1, freq2y = 3.7;   // secondary — fast zig-zag
+			const pathX = Math.sin(t * freq1x) * amp1 + Math.sin(t * freq2x + 1.0) * amp2;
+			const pathY = Math.sin(t * freq1y + 0.7) * amp1 + Math.cos(t * freq2y + 2.0) * amp2;
+
+			// Steer leader toward the sine path position (not snap — allows obstacle avoidance to deflect)
+			const pathForce = 18.0;
+			flock.leaderVel.x += (pathX - lp.x) * pathForce * deltaTime;
+			flock.leaderVel.y += (pathY - lp.y) * pathForce * deltaTime;
+
+			// Tunnel scroll
+			lp.z += speed * deltaTime;
+			// Swooping z-velocity: gentle approach with subtle variation
+			const zSwoop = 1.5 + Math.sin(t * 1.1) * 1.0 + Math.sin(t * 2.7) * 0.8; // ~0-3.3 range
+			lp.z += zSwoop * deltaTime;
+
+			// Dodge obstacles — deflects off the sine path temporarily
+			for (const obs of obstaclesRef.current) {
+				const op = obs.mesh.position;
+				const dx = lp.x - op.x, dy = lp.y - op.y, dz = lp.z - op.z;
+				const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+				if (dist < 5 && dist > 0.1) {
+					const urgency = (1 - dist / 5) * 30;
+					flock.leaderVel.x += (dx / dist) * urgency * deltaTime;
+					flock.leaderVel.y += (dy / dist) * urgency * deltaTime;
+				}
+			}
+			for (const cg of corkscrewGroupsRef.current) {
+				for (const co of cg.obstacles) {
+					const op = co.mesh.position;
+					const dx = lp.x - op.x, dy = lp.y - op.y, dz = lp.z - op.z;
+					const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+					if (dist < 5 && dist > 0.1) {
+						const urgency = (1 - dist / 5) * 30;
+						flock.leaderVel.x += (dx / dist) * urgency * deltaTime;
+						flock.leaderVel.y += (dy / dist) * urgency * deltaTime;
+					}
+				}
+			}
+			for (const rs of rollingSpheresRef.current) {
+				const op = rs.mesh.position;
+				const dx = lp.x - op.x, dy = lp.y - op.y, dz = lp.z - op.z;
+				const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+				if (dist < 5 && dist > 0.1) {
+					const urgency = (1 - dist / 5) * 30;
+					flock.leaderVel.x += (dx / dist) * urgency * deltaTime;
+					flock.leaderVel.y += (dy / dist) * urgency * deltaTime;
+				}
+			}
+
+			// Tunnel wall constraint
+			const lpDist = Math.sqrt(lp.x * lp.x + lp.y * lp.y);
+			if (lpDist > 3.2) {
+				const pushBack = (lpDist - 3.2) * 15;
+				flock.leaderVel.x -= (lp.x / lpDist) * pushBack * deltaTime;
+				flock.leaderVel.y -= (lp.y / lpDist) * pushBack * deltaTime;
+			}
+
+			// Damping — fairly low so the sine path drives motion crisply
+			flock.leaderVel.x *= 0.85;
+			flock.leaderVel.y *= 0.85;
+
+			// Apply velocity
+			lp.x += flock.leaderVel.x * deltaTime;
+			lp.y += flock.leaderVel.y * deltaTime;
+
+			// Update leader mesh
+			flock.leader.position.copy(lp);
+			const lMat = flock.leader.material as THREE.MeshStandardMaterial;
+			lMat.emissiveIntensity = 1.2 + Math.sin(elapsed / 250) * 0.4;
+
+			// ── Flock members: overshoot-and-correct physics ──
+			for (let fi = 0; fi < flock.members.length; fi++) {
+				const m = flock.members[fi];
+				const pos = m.mesh.position;
+
+				// Match tunnel scroll + z-swoop (same as leader so they stay in z-range)
+				pos.z += speed * deltaTime;
+				pos.z += zSwoop * deltaTime;
+
+				// 1) Chase the leader with HIGH acceleration + LOW damping = overshoot
+				const toLdrX = lp.x - pos.x;
+				const toLdrY = lp.y - pos.y;
+				const toLdrZ = lp.z - pos.z;
+				const ldrDist = Math.sqrt(toLdrX * toLdrX + toLdrY * toLdrY + toLdrZ * toLdrZ);
+				if (ldrDist > 0.01) {
+					// Very strong lateral acceleration — motes WILL overshoot the leader
+					const accel = 25.0 * m.accelScale;
+					m.vel.x += (toLdrX / ldrDist) * accel * deltaTime;
+					m.vel.y += (toLdrY / ldrDist) * accel * deltaTime;
+					// Z chase — gentler, base scroll handles most
+					const zChase = toLdrZ * 4.0 * m.accelScale;
+					m.vel.z += zChase * deltaTime;
+				}
+
+				// 2) Neighbor separation + alignment
+				let sepX = 0, sepY = 0, sepZ = 0;
+				let alignVX = 0, alignVY = 0, alignVZ = 0;
+				let neighborCount = 0;
+
+				for (let ni = 0; ni < flock.members.length; ni++) {
+					if (ni === fi) continue;
+					const other = flock.members[ni];
+					const ox = pos.x - other.mesh.position.x;
+					const oy = pos.y - other.mesh.position.y;
+					const oz = pos.z - other.mesh.position.z;
+					const nDist = Math.sqrt(ox * ox + oy * oy + oz * oz);
+					if (nDist < 1.5 && nDist > 0.01) {
+						const repel = (1 - nDist / 1.5) * 10.0;
+						sepX += (ox / nDist) * repel;
+						sepY += (oy / nDist) * repel;
+						sepZ += (oz / nDist) * repel;
+						alignVX += other.vel.x;
+						alignVY += other.vel.y;
+						alignVZ += other.vel.z;
+						neighborCount++;
+						if (neighborCount >= 6) break;
+					}
+				}
+
+				m.vel.x += sepX * deltaTime;
+				m.vel.y += sepY * deltaTime;
+				m.vel.z += sepZ * deltaTime;
+
+				if (neighborCount > 0) {
+					alignVX /= neighborCount;
+					alignVY /= neighborCount;
+					alignVZ /= neighborCount;
+					m.vel.x += (alignVX - m.vel.x) * 0.6 * deltaTime;
+					m.vel.y += (alignVY - m.vel.y) * 0.6 * deltaTime;
+					m.vel.z += (alignVZ - m.vel.z) * 0.4 * deltaTime;
+				}
+
+				// 3) Tunnel wall constraint
+				const mDist = Math.sqrt(pos.x * pos.x + pos.y * pos.y);
+				if (mDist > 3.6) {
+					const wallPush = (mDist - 3.6) * 16;
+					m.vel.x -= (pos.x / mDist) * wallPush * deltaTime;
+					m.vel.y -= (pos.y / mDist) * wallPush * deltaTime;
+				}
+
+				// 4) LOW damping — lets velocity carry past target (overshoot!)
+				// Variation per mote: faster motes overshoot more
+				const damp = 0.96 + m.accelScale * 0.015; // 0.969 – 0.981
+				m.vel.x *= damp;
+				m.vel.y *= damp;
+				m.vel.z *= 0.92; // z damps faster to prevent z-spread
+
+				// 5) Apply velocity
+				pos.x += m.vel.x * deltaTime;
+				pos.y += m.vel.y * deltaTime;
+				pos.z += m.vel.z * deltaTime;
+
+				// Glow pulses with speed — brighter when moving fast
+				const mSpeed = Math.sqrt(m.vel.x * m.vel.x + m.vel.y * m.vel.y);
+				const mMat = m.mesh.material as THREE.MeshStandardMaterial;
+				mMat.emissiveIntensity = 0.3 + Math.min(mSpeed * 0.15, 0.6) + Math.sin(elapsed / 400 + m.phase) * 0.15;
+			}
+
+			// Remove flock well after it passes the camera
+			if (lp.z > 20) {
+				disposeMesh(flock.leader);
+				sceneRef.current?.remove(flock.leader);
+				for (const m of flock.members) {
+					disposeMesh(m.mesh);
+					sceneRef.current?.remove(m.mesh);
+				}
+				flockRef.current = null;
+				lastFlockTime.current = Date.now();
+			}
+		}
+
 		// Update mote relay wave — continuous wavefront, 50% of motes
 		if (moteRelayRef.current) {
 			const relay = moteRelayRef.current;
@@ -2622,6 +2942,7 @@ export function TunnelGame() {
 			}
 		}
 
+		// Camera follows spaceship - adjusted for better tunnel visibility
 		// Camera follows spaceship - adjusted for better tunnel visibility
 		cameraRef.current.position.x = spaceshipRef.current.position.x * 0.2;
 		cameraRef.current.position.y = spaceshipRef.current.position.y * 0.2 + 1.5;
@@ -2738,6 +3059,15 @@ export function TunnelGame() {
 		projectilesRef.current = [];
 		motesRef.current.forEach((mote) => { disposeMesh(mote.mesh); sceneRef.current?.remove(mote.mesh); });
 		motesRef.current = [];
+		if (flockRef.current) {
+			disposeMesh(flockRef.current.leader);
+			sceneRef.current?.remove(flockRef.current.leader);
+			for (const m of flockRef.current.members) {
+				disposeMesh(m.mesh);
+				sceneRef.current?.remove(m.mesh);
+			}
+			flockRef.current = null;
+		}
 		corkscrewGroupsRef.current.forEach((group) => {
 			group.obstacles.forEach((obs) => {
 					const beh = (obs.mesh as unknown as { _behavior?: BehaviorState })?._behavior;
@@ -3033,7 +3363,7 @@ export function TunnelGame() {
 															.map((id) => playlistTracks.find((t) => t.id === id))
 															.filter((t): t is NonNullable<typeof t> => t != null && !!t.src && !t.unavailable);
 														playlistManagerRef.current.updatePlaylist(tracks, playlistVolume, playlist.shuffle);
-														playlistManagerRef.current.play();
+														playlistManagerRef.current.fadeIn(8000);
 													}
 												}
 											}}

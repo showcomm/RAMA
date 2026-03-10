@@ -358,6 +358,25 @@ export function updateMurmuration(ctx: BehaviorContext, entities: readonly Behav
 		? 1.0  // normal during gather
 		: 1.0 - flyProgress * 0.4; // compress to 60% radius during flight
 
+	// --- Find z-extent of recruited motes (for wave) ---
+	let minZ = Infinity, maxZ = -Infinity;
+	for (let i = 0; i < entities.length; i++) {
+		if (!_murmData.has(entities[i])) continue;
+		const z = entities[i].position.z;
+		if (z < minZ) minZ = z;
+		if (z > maxZ) maxZ = z;
+	}
+	const zSpan = maxZ - minZ;
+
+	// --- Invisible wavefront: bounces back and forth along the recruited line ---
+	// Ping-pong position within [minZ, maxZ]
+	const wavePeriod = 1.2; // seconds for one full pass
+	const waveT = (elapsedSec % (wavePeriod * 2)) / wavePeriod; // 0→2 sawtooth
+	const wavePingPong = waveT < 1 ? waveT : 2 - waveT; // 0→1→0 triangle
+	const wavefrontZ = minZ + wavePingPong * zSpan;
+	const waveWidth = Math.max(zSpan * 0.25, 3); // wavefront influence width
+	const waveAmp = 1.2; // max radial displacement
+
 	// --- Update each recruited mote ---
 	for (let i = 0; i < entities.length; i++) {
 		const e = entities[i];
@@ -384,6 +403,20 @@ export function updateMurmuration(ctx: BehaviorContext, entities: readonly Behav
 			// FLY: all motes move in unison on the helix, accelerating
 			e.position.x = moteTargetX;
 			e.position.y = moteTargetY;
+
+			// --- Wave displacement: push outward as wavefront passes ---
+			const dz = Math.abs(e.position.z - wavefrontZ);
+			if (dz < waveWidth) {
+				// Smooth bell curve falloff — strongest at wavefront center
+				const proximity = 1 - (dz / waveWidth);
+				const wavePush = proximity * proximity * waveAmp;
+				// Push radially outward from flock center
+				const dx = e.position.x - flockCX;
+				const dy = e.position.y - flockCY;
+				const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+				e.position.x += (dx / dist) * wavePush;
+				e.position.y += (dy / dist) * wavePush;
+			}
 
 			// Accelerate as the flock tightens — figure skater effect
 			const speedRamp = _evZBoostBase + (_evZBoostFlock - _evZBoostBase) * flyProgress;
